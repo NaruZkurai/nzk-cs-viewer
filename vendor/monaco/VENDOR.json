@@ -1,0 +1,21 @@
+{
+  "name": "monaco-editor",
+  "version": "0.57.0",
+  "what": "The complete published Monaco source distribution (esm/ + dev/ AMD + min/ + monaco.d.ts + licenses). This is VSCode's editor, exactly as microsoft/vscode publishes it under the monaco-editor package.",
+  "source": {
+    "tarball": "https://registry.npmjs.org/monaco-editor/-/monaco-editor-0.57.0.tgz",
+    "shasum": "9889fb51ddc27fe90e6da0e96c237c852adc4654",
+    "integrity": "sha512-5BkI9KGoqrNvBGUe15/QlZq3OooZ8WLg1AxTpaqHRCP3HNpzPPZKE2EDz8M7c+VRmCeUw1Brp4cx/PWm3kI/5A==",
+    "registry": "https://registry.npmjs.org/monaco-editor/0.57.0"
+  },
+  "integrity_self": {
+    "method": "sha256 over sorted \"relpath\\0size\\0sha256(content)\\n\" for every file",
+    "files": 1918,
+    "bytes": 101674083,
+    "tree_sha256": "5cf876f8a56316325bfc4c304885158adeb28163f7bcedec4f93155bf34f1871"
+  },
+  "runtime_entry": "min/vs/loader.js",
+  "runtime_amd_module": "vs/editor/editor.main",
+  "immutability": "This tree is vendored whole. No package manager ever touches it: nothing here is installed, hoisted, deduped or rewritten by npm, pnpm, yarn or any other tool. `python3 tools/csgraph/vendor_monaco.py --verify` recomputes the tree hash above and fails if a single byte moved.",
+  "runtime_dependencies": "none. marked and dompurify, which the esm/ build lists as dependencies, are inlined into the min/ bundle (verified by inspecting min/vs chunks); min/ is fully self-contained."
+}

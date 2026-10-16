@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="en">
+<head>
+<base href="/">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>csgraph — function relation graph</title>
+<link rel="stylesheet" href="/static/style.css">
+<!-- Monaco (VSCode's editor), vendored whole under /vendor/monaco. The AMD
+     loader is a classic sync script so `require` exists before any deferred
+     feature script runs. -->
+<script src="/vendor/monaco/min/vs/loader.js"></script>
+<!-- Classic scripts sharing one global scope, loaded in dependency order.
+     core holds the constants/state/DOM refs everything else reads.
+     tauri-shim rewrites /api/* fetch onto the Rust host's IPC channel. -->
+<script src="/static/tauri-shim.js"></script>
+<script src="/static/core.js" defer></script>
+<script src="/static/graph.js" defer></script>
+<script src="/static/layout.js" defer></script>
+<script src="/static/render.js" defer></script>
+<script src="/static/interaction.js" defer></script>
+<script src="/static/drawer.js" defer></script>
+<script src="/static/search.js" defer></script>
+<script src="/static/editor.js" defer></script>
+<script src="/static/language.js" defer></script>
+<!-- Editor feature modules. Each one registers itself through
+     window.CsEditorExtension (see editor.js) and owns its own file; they are
+     loaded after language.js and before the window/source plumbing. -->
+<script src="/static/hover.js" defer></script>
+<script src="/static/symbols.js" defer></script>
+<script src="/static/semantics.js" defer></script>
+<script src="/static/codelens.js" defer></script>
+<script src="/static/hierarchy.js" defer></script>
+<script src="/static/quickopen.js" defer></script>
+<script src="/static/nav.js" defer></script>
+<script src="/static/problems.js" defer></script>
+<script src="/static/windows.js" defer></script>
+<script src="/static/sync.js" defer></script>
+<script src="/static/panewin.js" defer></script>
+<script src="/static/source.js" defer></script>
+<script src="/static/filters.js" defer></script>
+<script src="/static/panels.js" defer></script>
+<script src="/static/shell.js" defer></script>
+<!-- Scratch-like read-only block canvas over the graph (uses only /api/* reads). -->
+<script src="/static/scratch.js" defer></script>
+<script src="/static/reorg.js" defer></script>
+<script src="/static/edit.js" defer></script>
+<script src="/static/preview.js" defer></script>
+<script src="/static/arrange.js" defer></script>
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand" title="csgraph — C# function relation graph">
+    <span class="brand-mark"></span>csgraph
+  </div>
+
+  <div class="rootpick">
+    <label class="sr-only" for="rootInput">Root folder</label>
+    <input id="rootInput" class="text-input" type="text" spellcheck="false" autocomplete="off"
+           placeholder="/absolute/path or repo-relative folder…">
+    <button id="browseBtn" class="btn" type="button" title="Pick the folder to index — opens the folder browser">Browse</button>
+    <button id="indexBtn" class="btn btn-primary" type="button" title="Build the graph from the chosen folder (re-runs parsing and indexing)" disabled>Index</button>
+  </div>
+
+  <div class="searchwrap">
+    <div class="mode-switch" role="tablist" aria-label="Search mode">
+      <button id="modeGraph" class="mode active" type="button" role="tab" aria-selected="true"
+              title="Graph search (/)">Graph</button>
+      <button id="modeFind" class="mode" type="button" role="tab" aria-selected="false"
+              title="Find definitions, implementations and usages (f)">Find</button>
+    </div>
+    <label class="sr-only" for="searchInput">Search symbols</label>
+    <input id="searchInput" class="text-input" type="text" spellcheck="false" autocomplete="off"
+           placeholder="Search symbols…  ( / )" role="combobox" aria-expanded="false" aria-controls="suggestions">
+    <div id="suggestions" class="suggestions hidden" role="listbox" aria-label="Search suggestions"></div>
+  </div>
+
+  <div id="statusLine" class="status" title="Index status">not indexed</div>
+
+  <button id="exportBtn" class="btn btn-ghost" type="button"
+          title="Merge or split the indexed C# and download it"
+          aria-haspopup="dialog" aria-controls="reorgModal">Export</button>
+
+  <button id="editBtn" class="btn btn-ghost" type="button"
+          title="Run the shared edit tools: rename, qualify, select, create and patch source"
+          aria-haspopup="dialog" aria-controls="editModal">Edit</button>
+
+  <button id="blocksBtn" class="btn btn-ghost" type="button"
+          title="Blocks — a read-only Scratch-like view of the current document: declarations as typed-port cards, reference edges between them (b)"
+          aria-pressed="false">Blocks</button>
+
+  <button id="previewBtn" class="btn btn-ghost" type="button"
+          title="Preview the signatures and call sites a rename or retype would change — read-only, writes nothing"
+          aria-haspopup="dialog" aria-controls="previewModal">Preview</button>
+
+  <button id="shortcutsBtn" class="btn btn-ghost shortcuts-btn" type="button"
+          title="Shortcuts &amp; settings (?)" aria-label="Shortcuts and settings"
+          aria-haspopup="dialog" aria-controls="shortcutsModal">
+    <svg class="shortcuts-gear" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" focusable="false">
+      <path fill="currentColor" d="M19.14 12.94a7.07 7.07 0 0 0 0-1.88l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.61-.22l-2.39.96a7.03 7.03 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.42H9.61a.5.5 0 0 0-.5.42l-.36 2.54a7.03 7.03 0 0 0-1.62.94l-2.39-.96a.5.5 0 0 0-.61.22L2.21 8.84a.5.5 0 0 0 .12.64l2.03 1.58a7.07 7.07 0 0 0 0 1.88L2.33 14.52a.5.5 0 0 0-.12.64l1.92 3.32a.5.5 0 0 0 .61.22l2.39-.96a7.03 7.03 0 0 0 1.62.94l.36 2.54a.5.5 0 0 0 .5.42h3.84a.5.5 0 0 0 .5-.42l.36-2.54a7.03 7.03 0 0 0 1.62-.94l2.39.96a.5.5 0 0 0 .61-.22l1.92-3.32a.5.5 0 0 0-.12-.64Zm-7.14 2.66A3.6 3.6 0 1 1 15.6 12 3.6 3.6 0 0 1 12 15.6Z"/>
+    </svg>
+  </button>
+</header>
+
+<main class="layout">
+
+  <section id="canvasWrap" class="canvas-wrap">
+    <canvas id="graph" aria-label="Function relation graph"></canvas>
+
+    <div id="tooltip" class="tooltip hidden" role="tooltip"></div>
+    <div id="emptyHint" class="empty-hint hidden"></div>
+    <div id="notice" class="notice hidden"></div>
+
+    <div class="canvas-tools">
+      <button id="backBtn" class="btn btn-ghost" type="button" title="Back to the previous node (Backspace)">← Back</button>
+      <button id="upBtn" class="btn btn-ghost" type="button" title="Go up to the parent (namespace / type)">↑ Up</button>
+      <button id="zoomInBtn" class="btn btn-ghost" type="button" title="Zoom in (+)">+</button>
+      <button id="zoomOutBtn" class="btn btn-ghost" type="button" title="Zoom out (−)">−</button>
+      <button id="fitBtn" class="btn btn-ghost" type="button" title="Fit graph to view">Fit</button>
+      <button id="wholeGraphBtn" class="btn btn-ghost" type="button" title="Load every namespace and its types">Full graph</button>
+      <button id="resettleBtn" class="btn btn-ghost" type="button" title="Re-run the FA2 + Noverlap layout (R)">Re-settle</button>
+      <span id="layoutState" class="layout-state"></span>
+    </div>
+
+    <div id="loading" class="loading hidden">
+      <div class="spinner" aria-hidden="true"></div>
+      <div id="loadingText" class="loading-text">Working…</div>
+      <button id="stopIndexBtn" class="btn btn-ghost" type="button" style="display:none"
+              title="Stop the running index. The previous graph stays loaded and usable.">Stop</button>
+    </div>
+
+    <!-- VT-style object drawer: properties + per-relation toggles -->
+    <aside id="nodeDrawer" class="drawer hidden" aria-label="Node properties and relations">
+      <div class="drawer-head">
+        <span id="nodeTitle" class="drawer-title">Node</span>
+        <span class="source-spacer"></span>
+        <button id="nodeCodeBtn" class="btn btn-ghost" type="button"
+                title="Show this declaration in the source viewer (C)">{ } View code</button>
+        <button id="nodeDrawerClose" class="btn btn-ghost" type="button" title="Close drawer">✕</button>
+      </div>
+      <div id="nodeCrumbs" class="crumbs"></div>
+      <div class="drawer-body">
+        <section class="section" id="propsSection">
+          <div class="section-body" id="nodeProps"></div>
+        </section>
+        <section class="section" id="relationsSection">
+          <button class="section-head" id="relationsHead" type="button" title="Collapse or expand the relation list for the selected node">
+            <span class="caret">▾</span>Relations<span class="scount" id="relationsCount"></span>
+          </button>
+          <div class="section-body" id="relationsBody" style="padding:0"></div>
+        </section>
+      </div>
+    </aside>
+
+    <aside id="findPanel" class="drawer hidden" aria-label="Find results">
+      <div class="drawer-head">
+        <span id="findQuery" class="find-query">Find</span>
+        <span id="findMeta" class="find-meta"></span>
+        <button id="findClose" class="btn btn-ghost" type="button" title="Leave Find mode (Esc)">✕</button>
+      </div>
+      <div id="findNotice" class="find-notice hidden"></div>
+      <div id="findResults" class="find-results"></div>
+      <div class="find-foot">
+        <span class="find-hint">fully-qualified names supported, e.g. <code>NZK.Core.MA.NormaliseName</code></span>
+      </div>
+    </aside>
+
+    <!-- Scratch-like, read-only block canvas (scratch.js): the current
+         document's declarations as block cards with typed ports, the reference
+         edges between them, a hover peek (source + references) and
+         click-to-navigate into the existing node view. No writes. -->
+    <aside id="blocksPanel" class="blocks-panel hidden" aria-label="Blocks — declarations and reference edges">
+      <div class="blocks-head">
+        <span id="blocksTitle" class="blocks-title">Blocks</span>
+        <span id="blocksMeta" class="blocks-meta"></span>
+        <span class="blocks-hint">click a block to navigate</span>
+        <button id="blocksClose" class="btn btn-ghost" type="button" title="Close the Blocks panel (b)">✕</button>
+      </div>
+      <div id="blocksScroll" class="blocks-scroll">
+        <div id="blocksStage" class="blocks-stage">
+          <svg id="blocksEdges" class="blocks-edges" aria-hidden="true"></svg>
+          <div id="blocksCards" class="blocks-cards"></div>
+        </div>
+      </div>
+      <div id="blocksPeek" class="blocks-peek hidden" role="tooltip">
+        <div class="bp-head">
+          <span id="blocksPeekKind" class="bp-kind"></span>
+          <span id="blocksPeekName" class="bp-name"></span>
+        </div>
+        <div id="blocksPeekFile" class="bp-file"></div>
+        <div id="blocksPeekSrc" class="bp-src">Loading source…</div>
+        <div id="blocksPeekRefs" class="bp-refs"></div>
+      </div>
+    </aside>
+  </section>
+
+  <aside class="side">
+
+    <section class="section" id="filtersSection">
+      <button class="section-head" id="filtersHead" type="button" title="Collapse or expand the filter controls">
+        <span class="caret">▾</span>Filters<span class="scount" id="filtersCount"></span>
+      </button>
+      <div class="section-body">
+
+        <div class="filter-label">
+          Namespace
+          <span class="filter-actions">
+            <button class="linkbtn" type="button" id="nsAllBtn" title="Show every namespace">all</button>
+          </span>
+        </div>
+        <select id="nsSelect" class="select filter-ns" title="Show only one namespace at a time">
+          <option value="">All namespaces</option>
+        </select>
+
+        <label class="check" style="margin-top:6px">
+          <input type="checkbox" id="nsDeep" checked>
+          <span title="On: the chosen namespace also keeps everything nested inside it
+                       (ns.subns.subsubns). Off: only what is declared directly in that
+                       one namespace — no sub-namespaces.">
+            Include sub-namespaces</span>
+        </label>
+
+        <div class="filter-label" style="margin-top:9px">
+          Node kinds
+          <span class="filter-actions">
+            <button class="linkbtn" type="button" data-kinds="all" title="Show every node kind">all</button>
+            <button class="linkbtn" type="button" data-kinds="none" title="Hide every node kind">none</button>
+          </span>
+        </div>
+        <div id="kindFilters"></div>
+
+        <div class="filter-label" style="margin-top:9px">
+          Edge kinds
+          <span class="filter-actions">
+            <button class="linkbtn" type="button" data-edges="all" title="Show every edge kind">all</button>
+            <button class="linkbtn" type="button" data-edges="none" title="Hide every edge kind">none</button>
+          </span>
+        </div>
+        <div id="edgeFilters" class="chips"></div>
+
+        <label class="check" style="margin-top:9px">
+          <input type="checkbox" id="hideEdgeLabels">
+          <span title="Hides only the Calling / Uses / Assigns / Constructs /
+                       Inherits / Children text pills. Every edge kind keeps its
+                       line and its arrow — no relation is removed.">
+            Hide edge word boxes</span>
+        </label>
+
+        <div class="filter-label" style="margin-top:9px">Groups</div>
+        <div class="chips">
+          <label class="edgekey" id="kindChildWrap"><input type="checkbox" id="groupChildren" checked hidden>
+            <span class="bars" style="border-top-color:#6b7897"></span>child nodes (contains)</label>
+          <label class="edgekey" id="kindEdgeWrap"><input type="checkbox" id="groupEdges" checked hidden>
+            <span class="bars" style="border-top-color:#6b7897"></span>edge nodes (calls/uses/…)</label>
+        </div>
+
+        <div class="filter-row" style="margin-top:9px">
+          <label class="check">
+            <input type="checkbox" id="hideIsolated">
+            <span>Hide isolated</span>
+          </label>
+          <label class="check">
+            <span>Depth</span>
+            <input type="number" id="depthSelect" class="select depth-input"
+                   min="0" max="9999999" step="1" value="1" inputmode="numeric"
+                   autocomplete="off" spellcheck="false"
+                   title="Neighbourhood depth: 0 shows only the node. Type a value, click the up/down arrows, or scroll the box (Shift = ×10). Range 0–9999999.">
+          </label>
+        </div>
+
+        <label class="check" style="margin-top:9px">
+          <input type="checkbox" id="hideChildren">
+          <span>Hide relations</span>
+        </label>
+
+        <div class="filter-row" style="margin-top:9px">
+          <button id="resetFilters" class="btn btn-ghost" type="button" title="Restore the default filters, layout and hidden-node state">Reset filters</button>
+          <button id="pruneHidden" class="btn btn-ghost" type="button"
+                  title="Delete nodes hidden by the filters from the graph">Remove hidden</button>
+        </div>
+
+        <div class="filter-group" style="margin-top:12px">
+          <div class="filter-label">Layout</div>
+          <label class="range" for="spacingRange">
+            <span class="range-name">Spacing</span>
+            <input id="spacingRange" type="range" min="8" max="240" step="1" value="120">
+            <output id="spacingOut" class="range-val">120</output>
+          </label>
+          <label class="range" for="nodeSizeRange">
+            <span class="range-name">Node size</span>
+            <input id="nodeSizeRange" type="range" min="2" max="24" step="1" value="8">
+            <output id="nodeSizeOut" class="range-val">8</output>
+          </label>
+          <label class="range" for="iterRange">
+            <span class="range-name">Iterations</span>
+            <input id="iterRange" type="range" min="300" max="1500" step="50" value="800">
+            <output id="iterOut" class="range-val">800</output>
+          </label>
+          <label class="range" for="curveRange">
+            <span class="range-name">Edge curve</span>
+            <input id="curveRange" type="range" min="0" max="0.2" step="0.01" value="0.1">
+            <output id="curveOut" class="range-val">0.10</output>
+          </label>
+        </div>
+
+        <p class="hint" style="margin-top:8px">Double-click a node to expand it · drag pins a node ·
+        hover shows relations · right-click a node to pin its card open · click selects.</p>
+      </div>
+    </section>
+
+    <section class="section collapsed" id="pubSection">
+      <button class="section-head" id="pubHead" type="button" title="Collapse or expand the list of public definitions">
+        <span class="caret">▸</span>Public definitions<span class="scount" id="pubCount"></span>
+      </button>
+      <div class="section-body">
+        <input id="pubSearch" class="mini-input" type="text" spellcheck="false"
+               placeholder="filter public definitions…">
+        <div id="pubList" class="listbox"><div class="list-empty">open to load</div></div>
+      </div>
+    </section>
+
+    <section class="section collapsed" id="strSection">
+      <button class="section-head" id="strHead" type="button" title="Collapse or expand the string-literal search">
+        <span class="caret">▸</span>Strings / error codes<span class="scount" id="strCount"></span>
+      </button>
+      <div class="section-body">
+        <input id="strSearch" class="mini-input" type="text" spellcheck="false" placeholder="filter strings…">
+        <div id="strList" class="listbox"><div class="list-empty">open to load</div></div>
+      </div>
+    </section>
+
+    <section class="section collapsed" id="chainSection">
+      <button class="section-head" id="chainHead" type="button" title="Collapse or expand the resolve-chain walker">
+        <span class="caret">▸</span>Resolve chain<span class="scount" id="chainCount"></span>
+      </button>
+      <div class="section-body">
+        <div class="chain-controls">
+          <select id="chainDepth" class="select">
+            <option>1</option><option>2</option><option selected>3</option>
+            <option>4</option><option>5</option><option>6</option>
+          </select>
+          <select id="chainDir" class="select">
+            <option value="forward" selected>forward</option>
+            <option value="backward">backward</option>
+            <option value="both">both</option>
+          </select>
+          <button id="chainRun" class="btn btn-ghost" type="button" title="Walk the resolve chain from the selected node">Run</button>
+          <button id="chainFlatBtn" class="btn btn-ghost" type="button" title="Toggle flat list">Flat</button>
+        </div>
+        <div id="chainTree" class="chain-tree"><div class="list-empty">Select a node, then Run.</div></div>
+      </div>
+    </section>
+
+  </aside>
+
+  <section id="sourcePane" class="source-pane hidden" aria-label="Source viewer">
+    <div class="source-head">
+      <span id="sourceTitle" class="source-title">—</span>
+      <button id="srcCopyBtn" class="btn btn-ghost" type="button" title="Copy the shown code (no line numbers)">Copy code</button>
+      <button id="srcRefBtn" class="btn btn-ghost" type="button" title="Copy file:line">Copy ref</button>
+      <span class="source-spacer"></span>
+      <span id="sourceChipWrap" class="source-chipwrap"></span>
+      <span id="sourceMatchTag" class="source-matchtag hidden"></span>
+      <select id="sourceTheme" class="select" title="Syntax theme">
+        <option value="darkplus">Dark+</option>
+        <option value="darkmodern">Dark Modern</option>
+        <option value="monokai">Monokai</option>
+        <option value="solarized">Solarized Dark</option>
+      </select>
+      <button id="srcModeBtn" class="btn btn-ghost" type="button"
+              title="Doc = every declaration site gathered into one synthesized file; Raw = the file as written">Doc</button>
+      <button id="srcPopBtn" class="btn btn-ghost" type="button"
+              title="Open this document in its own window (its own thread and its own editor worker)">⧉ New window</button>
+      <button id="srcMethodBtn" class="btn btn-ghost" type="button" title="Show the whole declaration">Whole method</button>
+      <button id="srcWindowBtn" class="btn btn-ghost" type="button" title="Show ±30 lines around the hit">Window</button>
+      <button id="srcPrevBtn" class="btn btn-ghost" type="button" title="Previous hit in this file">Prev</button>
+      <button id="srcNextBtn" class="btn btn-ghost" type="button" title="Next hit in this file">Next</button>
+      <button id="srcCloseBtn" class="btn btn-ghost" type="button" title="Close (Esc)">Close</button>
+    </div>
+    <div id="sourceBody" class="source-body"></div>
+    <div id="sourceNote" class="source-note"></div>
+  </section>
+</main>
+
+<div id="modal" class="modal-backdrop hidden" aria-hidden="true">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-head">
+      <h2 id="modalTitle">Choose a folder to index</h2>
+      <button id="modalClose" class="btn btn-ghost" type="button" title="Close the folder browser" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-path">
+      <label class="sr-only" for="modalPathInput">Folder path</label>
+      <input id="modalPathInput" class="text-input modal-path-input" type="text" spellcheck="false"
+             autocomplete="off" placeholder="/absolute/path or repo-relative folder…">
+      <button id="modalGo" class="btn" type="button" title="Open this folder">Go</button>
+    </div>
+    <div class="modal-path">
+      <button id="modalUp" class="btn btn-ghost" type="button" title="Parent folder">↑ Up</button>
+      <button id="modalHome" class="btn btn-ghost" type="button" title="Home folder">Home</button>
+      <button id="modalRoot" class="btn btn-ghost" type="button" title="Filesystem root">Root /</button>
+      <button id="modalRepo" class="btn btn-ghost" type="button" title="Repository root">Repo</button>
+      <code id="modalPath" class="modal-path-text">/</code>
+    </div>
+    <div id="modalBody" class="modal-body"></div>
+    <div class="modal-foot">
+      <span id="modalNote" class="modal-note"></span>
+      <button id="modalCancel" class="btn" type="button" title="Close without changing the indexed folder">Cancel</button>
+      <button id="modalSelect" class="btn btn-primary" type="button" title="Index the folder shown above" disabled>Select this folder</button>
+    </div>
+  </div>
+</div>
+
+<div id="shortcutsModal" class="modal-backdrop hidden" aria-hidden="true">
+  <div class="modal modal-shortcuts" role="dialog" aria-modal="true" aria-labelledby="shortcutsTitle">
+    <div class="modal-head">
+      <h2 id="shortcutsTitle">Keyboard shortcuts</h2>
+      <button id="shortcutsClose" class="btn btn-ghost" type="button" title="Close the shortcuts and settings dialog" aria-label="Close">✕</button>
+    </div>
+    <div class="settings-row">
+      <label class="settings-label" for="uiTheme">UI theme</label>
+      <select id="uiTheme" class="select" title="Whole-viewer theme: chrome and node kinds">
+        <option value="nzk-dark+">nzk-dark+ · VS Code Dark+</option>
+        <option value="dark-v1">dark v1</option>
+      </select>
+    </div>
+    <div id="shortcutsBody" class="modal-body shortcuts-body"></div>
+    <div class="modal-foot">
+      <span class="modal-note">Shortcuts are global; press <kbd>?</kbd> to reopen this.</span>
+      <button id="shortcutsDone" class="btn btn-primary" type="button" title="Close the shortcuts and settings dialog">Done</button>
+    </div>
+  </div>
+</div>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<div id="reorgModal" class="modal-backdrop hidden" aria-hidden="true">
+  <div class="modal modal-reorg" role="dialog" aria-modal="true" aria-labelledby="reorgTitle">
+    <div class="modal-head">
+      <h2 id="reorgTitle">Reorganise &amp; export</h2>
+      <button id="reorgClose" class="btn btn-ghost" type="button" title="Close the export dialog" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="reorg-lede">
+        Rebuild the indexed C# as one file, or as chunks you choose.
+        Every declaration and every byte of code is kept: only the file layout changes.
+      </p>
+      <div class="settings-row">
+        <label class="settings-label" for="reorgMode">Output</label>
+        <select id="reorgMode" class="select">
+          <option value="single">One merged file</option>
+          <option value="split">Split into chunks</option>
+        </select>
+      </div>
+      <div class="settings-row">
+        <label class="settings-label" for="reorgScope">What to move</label>
+        <select id="reorgScope" class="select">
+          <option value="selection">The graph selection</option>
+          <option value="all">The whole corpus</option>
+        </select>
+      </div>
+      <div class="settings-row" id="reorgGranRow">
+        <label class="settings-label" for="reorgGran">Chunk unit</label>
+        <select id="reorgGran" class="select">
+          <option value="leaf">One declaration per chunk</option>
+          <option value="top">Whole top-level types</option>
+        </select>
+      </div>
+      <div class="settings-row" id="reorgGroupRow">
+        <label class="settings-label" for="reorgGroup">Grouping</label>
+        <select id="reorgGroup" class="select">
+          <option value="size">By size budget</option>
+          <option value="namespace">By namespace</option>
+          <option value="owner">By owning type</option>
+          <option value="single">Everything in one file</option>
+        </select>
+      </div>
+      <div class="settings-row" id="reorgSizeRow">
+        <label class="settings-label" for="reorgSize">Lines per file</label>
+        <input id="reorgSize" class="text-input" type="number" min="50" step="50" value="3000">
+      </div>
+      <div class="settings-row">
+        <label class="settings-label" for="reorgDest">Write to</label>
+        <input id="reorgDest" class="text-input" type="text" spellcheck="false"
+               placeholder="absolute folder — leave empty to only download">
+      </div>
+      <div class="settings-row">
+        <label class="settings-label" for="reorgHeader">Banner comment</label>
+        <input id="reorgHeader" type="checkbox" checked
+               title="Prefix each file with a short auto-generated comment">
+      </div>
+      <div id="reorgReport" class="reorg-report"></div>
+    </div>
+    <div class="modal-foot">
+      <span id="reorgNote" class="modal-note"></span>
+      <button id="reorgCompile" class="btn" type="button"
+              title="Compile the source and the result with Unity's Roslyn and compare the diagnostics">Compile</button>
+      <button id="reorgVerify" class="btn" type="button"
+              title="Build the output and prove every declaration and byte survives">Verify</button>
+      <button id="reorgWrite" class="btn" type="button" title="Write the reorganised files to the folder above">Write</button>
+      <button id="reorgZip" class="btn btn-primary" type="button" title="Download the reorganised source as a .zip">Download .zip</button>
+    </div>
+  </div>
+</div>
+
+<div id="editModal" class="modal-backdrop hidden" aria-hidden="true">
+  <div class="modal modal-edit" role="dialog" aria-modal="true" aria-labelledby="editTitle">
+    <div class="modal-head">
+      <h2 id="editTitle">Edit tools</h2>
+      <button id="editClose" class="btn btn-ghost" type="button" title="Close the edit dialog" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="reorg-lede">
+        The same named operations an agent has over MCP, dispatched by the host's shared edit layer.
+        Every write tool defaults to a dry run; <b>Apply</b> sends <code>apply: true</code>.
+        <b>Validate</b> runs the Roslyn parse gate over the corpus (a missing toolchain is reported
+        as skipped, never as a pass) and <b>Duplicates</b> reports repeated code.
+      </p>
+      <div class="settings-row">
+        <label class="settings-label" for="editTool">Operation</label>
+        <select id="editTool" class="select"></select>
+      </div>
+      <div class="settings-row" style="align-items:flex-start">
+        <label class="settings-label" for="editArgs">Args (JSON)</label>
+        <textarea id="editArgs" class="text-input" spellcheck="false" rows="7"
+                  style="flex:1 1 auto; min-width:0; font-family:var(--mono); font-size:11.5px; resize:vertical"
+                  placeholder='{"like": ["sps", "pcs"], "limit": 50}'>{}</textarea>
+      </div>
+      <pre id="editOut" class="reorg-report" aria-live="polite"></pre>
+    </div>
+    <div class="modal-foot">
+      <span id="editNote" class="modal-note"></span>
+      <button id="editValidate" class="btn" type="button"
+              title="Run the Roslyn parse gate over the corpus (reports a skipped reason honestly)">Validate</button>
+      <button id="editDedupe" class="btn" type="button"
+              title="Report exact/near duplicate bodies and repeated blocks">Duplicates</button>
+      <button id="editDry" class="btn" type="button" title="Preview the plan without writing anything">Dry-run</button>
+      <button id="editApply" class="btn btn-primary" type="button" title="Run the tool with apply:true (write tools only)">Apply</button>
+    </div>
+  </div>
+</div>
+
+<div id="previewModal" class="modal-backdrop hidden" aria-hidden="true">
+  <div class="modal modal-preview" role="dialog" aria-modal="true" aria-labelledby="previewTitle">
+    <div class="modal-head">
+      <h2 id="previewTitle">Change preview</h2>
+      <button id="previewClose" class="btn btn-ghost" type="button" title="Close the preview dialog" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="reorg-lede">
+        What would change <b>before</b> anything is written: the current and proposed
+        signature, every affected declaration and call site with its line number, and the
+        exact edits an apply would make. This panel is read-only — it has no apply path
+        and the engine always reports <code>writes: []</code>.
+      </p>
+      <div class="settings-row">
+        <label class="settings-label" for="previewSelector">Declaration</label>
+        <input id="previewSelector" class="text-input" type="text" spellcheck="false"
+               placeholder="node id, full name, or a unique simple name (defaults to the selection)">
+      </div>
+      <div class="settings-row">
+        <label class="settings-label" for="previewOp">Change</label>
+        <select id="previewOp" class="select"></select>
+      </div>
+      <div class="settings-row">
+        <label class="settings-label" for="previewTo">New name / type</label>
+        <input id="previewTo" class="text-input" type="text" spellcheck="false"
+               placeholder="e.g. Plus  —  or  long">
+      </div>
+      <div id="previewOut" class="reorg-report preview-out"></div>
+    </div>
+    <div class="modal-foot">
+      <span id="previewNote" class="modal-note"></span>
+      <button id="previewRun" class="btn btn-primary" type="button"
+              title="Plan the change — read-only, writes nothing">Preview</button>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

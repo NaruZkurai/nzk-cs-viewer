@@ -1,0 +1,23 @@
+# csviewer v2 — the RUST-ONLY viewer.
+#
+# A cargo workspace: `core` is the whole csgraph engine (parser, graph, doc,
+# reorg, cache) with no GUI dependency at all; `app` is the Tauri host that
+# serves the frontend and answers its /api/* calls in-process.
+#
+# The only Python left in v2 is the CS splitter (python/splitter/). Nothing
+# here shells out to Python for the graph.
+[workspace]
+resolver = "2"
+members = ["core", "app"]
+
+[workspace.package]
+version = "2.0.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/nzk/csviewer"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = true

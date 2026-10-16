@@ -1,0 +1,13 @@
+<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <PropertyGroup>
+    <AssemblyName>Legacy</AssemblyName>
+    <DefineConstants>TRACE;LEGACY_ONLY</DefineConstants>
+  </PropertyGroup>
+
+  <!-- Old-style project: only the explicitly listed file is a source. -->
+  <ItemGroup>
+    <Compile Include="Legacy.cs" />
+  </ItemGroup>
+
+</Project>

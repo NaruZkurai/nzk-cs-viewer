@@ -1,0 +1,22 @@
+[package]
+name = "csgraph-core"
+description = "The csgraph C# relation-graph engine: lexer, parser, graph, document synthesis, reorganisation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "csgraph_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "csgraph"
+path = "src/bin/csgraph.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+flate2 = "1"
+walkdir = "2"
+crossbeam-channel = "0.5"

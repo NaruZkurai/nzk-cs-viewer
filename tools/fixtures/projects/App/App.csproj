@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <AssemblyName>DemoApp</AssemblyName>
+    <TargetFramework>net472</TargetFramework>
+    <DefineConstants>TRACE;UNITY_EDITOR;APP_ONLY</DefineConstants>
+  </PropertyGroup>
+
+  <!-- The SDK globs App/**/*.cs; this shared file is compiled in explicitly. -->
+  <ItemGroup>
+    <Compile Include="..\Shared\Shared.cs" />
+  </ItemGroup>
+
+</Project>

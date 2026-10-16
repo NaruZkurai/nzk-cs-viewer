@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Deliberately no <AssemblyName>: the model falls back to the file stem. -->
+    <TargetFrameworks>netstandard2.0;net472</TargetFrameworks>
+    <DefineConstants>TRACE;LIB_ONLY</DefineConstants>
+  </PropertyGroup>
+
+</Project>
