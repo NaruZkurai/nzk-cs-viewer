@@ -85,7 +85,8 @@ cargo test --workspace
 ( cd nzk_ui && cargo test )
 ```
 
-The in-tree unit tests are self-contained. A few host tests exercise a real
+The in-tree unit tests are self-contained. The nzk_ui <-> host wire test lives
+in the optional testing repo below, alongside the fixture corpora. A few host tests exercise a real
 project fixture corpus; when that optional fixture is not present they print a
 skip line and pass.
 

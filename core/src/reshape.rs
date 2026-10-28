@@ -2231,6 +2231,24 @@ pub fn functionize(index: &Index, args: &Value) -> Value {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+fn reshape_fixture_dir() -> Option<std::path::PathBuf> {
+    let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../tools/fixtures/reshape");
+    src.is_dir().then_some(src)
+}
+
+/// The reshape tests use external fixture files. When the optional testing
+/// repo is not linked in, skip them instead of failing the public test run.
+macro_rules! require_reshape_fixture {
+    () => {
+        if reshape_fixture_dir().is_none() {
+            eprintln!("[reshape] tools/fixtures/reshape absent; skipping");
+            return;
+        }
+    };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
@@ -2280,6 +2298,7 @@ mod tests {
 
     #[test]
     fn reformat_dry_run_plans_every_dialect_pass_and_writes_nothing() {
+        require_reshape_fixture!();
         let (dir, ix) = indexed("dry");
         let before = fs::read_to_string(dir.join("box.cs")).unwrap();
         let out = reformat(&ix, &json!({"file": "box.cs"}));
@@ -2309,6 +2328,7 @@ mod tests {
 
     #[test]
     fn reformat_apply_writes_atomically_and_reports_the_gate() {
+        require_reshape_fixture!();
         let (dir, ix) = indexed("apply");
         let out = reformat(&ix, &json!({"file": "box.cs", "apply": true}));
         assert_eq!(out["ok"], json!(true), "{out}");
@@ -2328,6 +2348,7 @@ mod tests {
 
     #[test]
     fn reformat_refuses_a_comment_body_containing_the_close_marker() {
+        require_reshape_fixture!();
         let (dir, ix) = indexed("unsafe");
         let before = fs::read_to_string(dir.join("unsafe_comment.cs")).unwrap();
         let out = reformat(&ix, &json!({"file": "unsafe_comment.cs"}));
@@ -2339,6 +2360,7 @@ mod tests {
 
     #[test]
     fn reformat_skipped_gate_is_unverified_and_require_validated_refuses() {
+        require_reshape_fixture!();
         let (dir, ix) = indexed("validity");
         // A missing toolchain: the gate reports skipped, and the payload must say
         // unverified rather than silently passing.
@@ -2375,6 +2397,7 @@ mod tests {
 
     #[test]
     fn functionize_dry_run_extracts_a_helper_and_rewrites_every_site() {
+        require_reshape_fixture!();
         let (dir, ix) = indexed("fn-dry");
         let a = node_id(&ix, "Twice");
         let b = node_id(&ix, "Double");
@@ -2402,6 +2425,7 @@ mod tests {
 
     #[test]
     fn functionize_apply_writes_the_helper_and_the_calls() {
+        require_reshape_fixture!();
         let (dir, ix) = indexed("fn-apply");
         let a = node_id(&ix, "Twice");
         let b = node_id(&ix, "Double");
@@ -2429,6 +2453,7 @@ mod tests {
 
     #[test]
     fn functionize_refuses_members_whose_bodies_differ() {
+        require_reshape_fixture!();
         let (dir, ix) = indexed("fn-differ");
         let a = node_id(&ix, "Twice");
         let sum = node_id(&ix, "Sum");
@@ -2444,6 +2469,7 @@ mod tests {
 
     #[test]
     fn functionize_refuses_a_free_identifier_it_cannot_resolve() {
+        require_reshape_fixture!();
         let (dir, _ix) = indexed("fn-unresolved");
         // `Counter.Sum` is uniquely resolvable through the graph, so this body
         // extracts. A body calling an unknown bare method must refuse instead.
@@ -2492,6 +2518,7 @@ mod decl_tests {
 
     #[test]
     fn reformat_of_a_single_declaration_leaves_the_wrapper_alone() {
+        require_reshape_fixture!();
         let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tools/fixtures/reshape");
         let dir = std::env::temp_dir().join(format!("csgraph-reshape-decl-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -2531,6 +2558,7 @@ mod idempotence_tests {
 
     #[test]
     fn reformat_is_idempotent() {
+        require_reshape_fixture!();
         let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tools/fixtures/reshape");
         let dir = std::env::temp_dir().join(format!("csgraph-reshape-idem-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -2592,6 +2620,7 @@ mod interpolation_tests {
     /// survive byte-for-byte.
     #[test]
     fn reformat_keeps_interpolated_strings_with_nested_literals() {
+        require_reshape_fixture!();
         let dir = copy_fixture("interp");
         let mut ix = Index::new(dir.clone());
         ix.build(&[".".to_string()], &[], &Config::default());
