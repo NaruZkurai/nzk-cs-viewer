@@ -4740,6 +4740,7 @@ fn supports(bin: &Path, flag: &str) -> bool {
 
 fn run(bin: &Path, args: &[&str]) -> Result<(), String> {
     let out = Command::new(bin)
+        .env("CSVIEWER_FRONTEND_DIR", viewer_frontend_dir())
         .args(args)
         .output()
         .map_err(|e| format!("spawn {}: {e}", bin.display()))?;
@@ -4884,7 +4885,21 @@ pub fn digest_rgba(rgba: &[u8]) -> String {
     format!("{h:016x}")
 }
 
-/// Locate the nzk_ui executable: env override, then the fork's build layout.
+/// The viewer's own frontend pair, handed to the nzk_ui child so a separate
+/// module checkout still renders this host's stylesheet.
+pub(crate) fn viewer_frontend_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("../../frontend");
+            if p.join("index.html").is_file() {
+                return p;
+            }
+        }
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../frontend")
+}
+
+/// Locate the nzk_ui executable: env override, then the module build layout.
 fn find_bin() -> Option<PathBuf> {    if let Some(p) = env_bin() {
         let p = PathBuf::from(p);
         if p.is_file() {
@@ -4896,12 +4911,15 @@ fn find_bin() -> Option<PathBuf> {    if let Some(p) = env_bin() {
         if let Some(dir) = exe.parent() {
             cands.push(dir.join("../../nzk_ui/target/release/nzk_ui"));
             cands.push(dir.join("../../nzk_ui/target/debug/nzk_ui"));
+            cands.push(dir.join("../../NZKRepoDeps/CSV Module (nzk-cs-rs_nzk_ui)/target/release/nzk_ui"));
+            cands.push(dir.join("../../NZKRepoDeps/CSV Module (nzk-cs-rs_nzk_ui)/target/debug/nzk_ui"));
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
         cands.push(cwd.join("nzk_ui/target/release/nzk_ui"));
         cands.push(cwd.join("../nzk_ui/target/release/nzk_ui"));
-        cands.push(cwd.join("nzk_ui/target/release/nzk_ui"));
+        cands.push(cwd.join("../NZKRepoDeps/CSV Module (nzk-cs-rs_nzk_ui)/target/release/nzk_ui"));
+        cands.push(cwd.join("../NZKRepoDeps/CSV Module (nzk-cs-rs_nzk_ui)/target/debug/nzk_ui"));
     }
     cands.into_iter().find(|p| p.is_file())
 }
@@ -5538,6 +5556,12 @@ mod dispatch_tests {
         find_bin().or_else(|| {
             let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../nzk_ui/target/release/nzk_ui");
+            if p.is_file() { return Some(p); }
+            let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../NZKRepoDeps/CSV Module (nzk-cs-rs_nzk_ui)/target/release/nzk_ui");
+            if p.is_file() { return Some(p); }
+            let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../NZKRepoDeps/CSV Module (nzk-cs-rs_nzk_ui)/target/debug/nzk_ui");
             p.is_file().then_some(p)
         })
     }

@@ -23,8 +23,9 @@ app/                        winit + wgpu + egui host
   src/graphviz.rs           exact FA2 + Noveria graph layout
   src/windows.rs            attach/snap/detach window geometry
 core/                       csgraph engine: lexer, parser, graph, doc, reorg, cache, MCP
-nzk_ui/                     separate workspace: HTML/CSS -> RGBA + resolved boxes
 frontend/                   the real index.html + static/style.css
+                            (the nzk_ui renderer is its own module repo:
+                             NZKRepoDeps/CSV Module (nzk-cs-rs_nzk_ui))
 packaging/                  AppImage builder
 ```
 
@@ -37,8 +38,9 @@ The three IDE addons are **git dependencies pinned by commit** in
 | `scratch-rs-ide-addon` | `NaruZkurai/nzk-csViewer-scratch_rs_ide_addon` | `d5491fe` |
 | `def2mcpfnnumber` | `NaruZkurai/nzk-cs-def2mcpfnnumber_rs_ide_addon` | `a063dfc` |
 
-`nzk_ui/` is a second workspace with its own lockfile so its Blitz/Vello
-dependency set never leaks into the host.
+`nzk_ui` is now its own module repository, so its Blitz/Vello dependency set
+never leaks into the host. Clone it into
+`../NZKRepoDeps/CSV Module (nzk-cs-rs_nzk_ui)` beside this checkout.
 
 ## Build
 
@@ -52,9 +54,12 @@ GitHub.
 # host (puts the binary at target/release/native-csviewer)
 cargo build --release
 
-# the CSS shell child, beside the host as the app expects
-( cd nzk_ui && cargo build --release )
+# the CSS shell child module, checked out under ../NZKRepoDeps/
+( cd "../NZKRepoDeps/CSV Module (nzk-cs-rs_nzk_ui)" && cargo build --release )
 ```
+
+The host finds the child in `NZKRepoDeps/CSV Module (nzk-cs-rs_nzk_ui)/target/`
+and hands it this repository's `frontend/` through `CSVIEWER_FRONTEND_DIR`.
 
 The host looks for `nzk_ui/target/{release,debug}/nzk_ui` relative to its own
 executable (and the current directory), so the layout above works without any
@@ -82,7 +87,7 @@ Headless / offscreen:
 
 ```bash
 cargo test --workspace
-( cd nzk_ui && cargo test )
+( cd "../NZKRepoDeps/CSV Module (nzk-cs-rs_nzk_ui)" && cargo test )
 ```
 
 The in-tree unit tests are self-contained. The nzk_ui <-> host wire test lives

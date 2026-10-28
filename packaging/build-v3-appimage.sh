@@ -147,7 +147,12 @@ fi
 # 2. Build the release binaries (unless --skip-build/--bin)
 # ---------------------------------------------------------------------------
 BIN="$TARGET_DIR/release/$APP_BIN"
-UI_BIN="$FORK_DIR/nzk_ui/target/release/nzk_ui"
+# nzk_ui is its own module repository.
+UI_SRC="$REPO_ROOT/NZKRepoDeps/CSV Module (nzk-cs-rs_nzk_ui)"
+if [ ! -d "$UI_SRC" ]; then
+  UI_SRC="$(cd -- "$FORK_DIR/.." && pwd -P)/NZKRepoDeps/CSV Module (nzk-cs-rs_nzk_ui)"
+fi
+UI_BIN="$UI_SRC/target/release/nzk_ui"
 
 if [ -n "$BIN_OVERRIDE" ]; then
   BIN="$BIN_OVERRIDE"
@@ -182,8 +187,9 @@ fi
 
 if [ ! -x "$UI_BIN" ]; then
   log "building nzk_ui release (CSS shell child)"
-  ( cd "$FORK_DIR/nzk_ui" && CARGO_HOME="$CARGO_HOME_DIR" \
-      CARGO_TARGET_DIR="$FORK_DIR/nzk_ui/target" cargo build --release ) \
+  [ -d "$UI_SRC" ] || die "nzk_ui module missing at $UI_SRC (clone nzk-cs-rs_nzk_ui)"
+  ( cd "$UI_SRC" && CARGO_HOME="$CARGO_HOME_DIR" \
+      CARGO_TARGET_DIR="$UI_SRC/target" cargo build --release ) \
     || die "nzk_ui release build failed"
 fi
 [ -x "$UI_BIN" ] || die "nzk_ui release binary not found: $UI_BIN"
@@ -230,6 +236,8 @@ fi
 # frontend: the real index.html + style.css, exactly what nzk_ui parses.
 cp -a -- "$ORIG_DIR/frontend/index.html" "$APPDIR/usr/share/csviewer/frontend/index.html"
 cp -a -- "$ORIG_DIR/frontend/static/style.css" "$APPDIR/usr/share/csviewer/frontend/static/style.css"
+mkdir -p "$APPDIR/usr/share/csviewer/assets/css"
+cp -a -- "$UI_SRC/assets/css/." "$APPDIR/usr/share/csviewer/assets/css/"
 
 # nzk_ui wrapper at the path app/src/nzk_ui.rs::find_bin() probes
 # (current_exe/../../nzk_ui/target/release/nzk_ui -> <AppDir>/nzk_ui/...)
@@ -292,6 +300,7 @@ fi
 export APPDIR="\$HERE"
 # The nzk_ui child must find the real frontend inside the AppImage.
 export CSVIEWER_NZK_UI_BIN="\$HERE/nzk_ui/target/release/nzk_ui"
+export CSVIEWER_NZK_UI_ASSETS="\$HERE/usr/share/csviewer/assets/css"
 # Legacy alias: the old name points at the same binary.
 export CSVIEWER_CSS_SHELL_BIN="\$CSVIEWER_NZK_UI_BIN"
 exec "\$HERE/usr/bin/$APP_BIN" "\$@"
@@ -394,7 +403,8 @@ if [ "$VERIFY" = 1 ]; then
            nzk_ui/target/release/nzk_ui \
            usr/share/csviewer/BUILD-INFO \
            usr/share/csviewer/frontend/index.html \
-           usr/share/csviewer/frontend/static/style.css; do
+           usr/share/csviewer/frontend/static/style.css \
+           usr/share/csviewer/assets/css/compat.css; do
     [ -e "$ROOT/$f" ] || die "verify: missing $f inside the AppImage"
   done
   ok "AppDir contents present"

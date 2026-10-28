@@ -166,7 +166,8 @@ impl NzkUiClient {
     /// the one-shot path rather than showing nothing.
     pub fn spawn(bin: &Path, size: (u32, u32), repo: &str) -> Result<Self, String> {
         let mut cmd = Command::new(bin);
-        cmd.arg("--serve")
+        cmd.env("CSVIEWER_FRONTEND_DIR", crate::app::nzk_ui::viewer_frontend_dir())
+            .arg("--serve")
             .arg("--size")
             .arg(format!("{}x{}", size.0, size.1))
             .arg("--repo")
