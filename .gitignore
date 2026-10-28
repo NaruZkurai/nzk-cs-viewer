@@ -1,16 +1,17 @@
 # Build output
 /target
-/nzk_ui/target
 /build-work-v3
 /builds
 
 # Vendored crates.io sources (large, regenerated; see README)
 /vendor
-/nzk_ui/vendor
 /.cargo-home
 
 # Archived v1/v2 trees are kept locally only (never tracked)
 /.old
+
+# v2 index/viewer cache; never source
+**/.csgraph.v2/
 
 # Python bytecode
 __pycache__/
