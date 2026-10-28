@@ -33,7 +33,7 @@ The three IDE addons are **git dependencies pinned by commit** in
 
 | crate | repository | pinned commit |
 |---|---|---|
-| `nzkide-module` | `NaruZkurai/nzk-cs-nzkide_module` | `e4f104f` |
+| `nzkide-module` | `NaruZkurai/nzk-cs-nzkide_module` | `a204c5b` |
 | `scratch-rs-ide-addon` | `NaruZkurai/nzk-csViewer-scratch_rs_ide_addon` | `d5491fe` |
 | `def2mcpfnnumber` | `NaruZkurai/nzk-cs-def2mcpfnnumber_rs_ide_addon` | `a063dfc` |
 

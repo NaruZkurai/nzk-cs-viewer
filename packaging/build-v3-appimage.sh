@@ -39,23 +39,35 @@
 #                                   [--skip-build] [--bin PATH] [--verify]
 #                                   [--appimagetool PATH] [--keep-stage]
 #                                   [--no-download]
-#  Defaults: --version 3.0.0-alpha.1, --out "<repo>/cs viewer builds",
-#            own CARGO_TARGET_DIR (target/release-v3), CARGO_HOME=.cargo-home.
+#  Defaults: --version 3.0.0-beta.9, --out "<CsViewerGitRepo>/Builds/AppImages",
+#            own CARGO_TARGET_DIR (target/release-v3), CARGO_HOME=<CsViewerGitRepo>/Builder/.cargo.
 # =============================================================================
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"   # repo/packaging
-FORK_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"                          # repo root
-BUILDER_DIR="$FORK_DIR"
-REPO_ROOT="$FORK_DIR"
-DEPS_DIR="$REPO_ROOT/deps"
-ORIG_DIR="$REPO_ROOT"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"   # .../packaging
+FORK_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"                          # the viewer source tree
+# Two supported layouts:
+#   * standalone nzk-cs-viewer checkout: fork == repo root
+#   * CsViewerGitRepo workspace:         fork == <root>/BaseCode
+if [ -d "$(dirname -- "$FORK_DIR")/Builder" ] && [ -d "$(dirname -- "$FORK_DIR")/NZKRepoDeps" ]; then
+  REPO_ROOT="$(cd -- "$FORK_DIR/.." && pwd -P)"
+  BUILDER_DIR="$REPO_ROOT/Builder"
+  DEFAULT_OUT="$REPO_ROOT/Builds/AppImages"
+  DEFAULT_WORK="$REPO_ROOT/Builds/build-work-v3"
+else
+  REPO_ROOT="$FORK_DIR"
+  BUILDER_DIR="$FORK_DIR"
+  DEFAULT_OUT="$REPO_ROOT/builds"
+  DEFAULT_WORK="$REPO_ROOT/build-work-v3"
+fi
+DEPS_DIR="$BUILDER_DIR/deps"
+ORIG_DIR="$FORK_DIR"
 
 ARCH="${CSVIEWER_ARCH:-x86_64}"
 APP_ID="csviewer-v3"
 APP_BIN="native-csviewer"
-VERSION="${CSVIEWER_VERSION:-3.0.0-alpha.1}"
-OUTPUT_DIR="${CSVIEWER_OUTPUT_DIR:-$REPO_ROOT/builds}"
+VERSION="${CSVIEWER_VERSION:-3.0.0-beta.9}"
+OUTPUT_DIR="${CSVIEWER_OUTPUT_DIR:-$DEFAULT_OUT}"
 NO_LATEST=0
 SKIP_BUILD=0
 BIN_OVERRIDE=""
@@ -64,10 +76,18 @@ KEEP_STAGE=0
 ALLOW_DOWNLOAD=1
 APPIMAGETOOL_ARG=""
 
-WORK_DIR="$REPO_ROOT/build-work-v3"
+WORK_DIR="$DEFAULT_WORK"
 APPDIR="$WORK_DIR/CSViewerV3.AppDir"
 TARGET_DIR="${CSVIEWER_V3_TARGET_DIR:-$FORK_DIR/target/release-v3}"
-CARGO_HOME_DIR="${CSVIEWER_CARGO_HOME:-${CARGO_HOME:-$HOME/.cargo}}"
+if [ -n "${CSVIEWER_CARGO_HOME:-}" ]; then
+  CARGO_HOME_DIR="$CSVIEWER_CARGO_HOME"
+elif [ -n "${CARGO_HOME:-}" ]; then
+  CARGO_HOME_DIR="$CARGO_HOME"
+elif [ -d "$BUILDER_DIR/.cargo" ]; then
+  CARGO_HOME_DIR="$BUILDER_DIR/.cargo"
+else
+  CARGO_HOME_DIR="$HOME/.cargo"
+fi
 
 c_blue=$'\033[1;34m'; c_green=$'\033[1;32m'; c_yellow=$'\033[1;33m'
 c_red=$'\033[1;31m';  c_off=$'\033[0m'
@@ -159,6 +179,13 @@ else
   log "skipping cargo build (--skip-build)"
 fi
 [ -x "$BIN" ] || die "release binary not found: $BIN (build it or pass --bin)"
+
+if [ ! -x "$UI_BIN" ]; then
+  log "building nzk_ui release (CSS shell child)"
+  ( cd "$FORK_DIR/nzk_ui" && CARGO_HOME="$CARGO_HOME_DIR" \
+      CARGO_TARGET_DIR="$FORK_DIR/nzk_ui/target" cargo build --release ) \
+    || die "nzk_ui release build failed"
+fi
 [ -x "$UI_BIN" ] || die "nzk_ui release binary not found: $UI_BIN"
 
 V3_STAMP="$("$BIN" --version 2>/dev/null || true)"
@@ -167,6 +194,15 @@ case "$V3_STAMP" in
   "") warn "could not read --version from $BIN" ;;
   *) die "unexpected --version output (not v3): $V3_STAMP" ;;
 esac
+
+# The AppImage must carry all three IDE modules, statically linked. The host
+# reports them itself, so this is the same check a user can run after install.
+MODULES_REPORT="$("$BIN" --modules 2>/dev/null || true)"
+for mod in def2mcpfnnumber scratch-rs-ide-addon nzkide-module; do
+  printf '%s\n' "$MODULES_REPORT" | grep -q "$mod" \
+    || die "host is missing a linked module: $mod"
+done
+ok "host links all three modules (tokenizer + scratch + nzkide)"
 
 # ---------------------------------------------------------------------------
 # 3. Stage the AppDir
@@ -287,6 +323,7 @@ cp -a -- "$APPDIR/$APP_ID.desktop" "$APPDIR/usr/share/applications/$APP_ID.deskt
   printf 'binary=%s\n' "$APP_BIN"
   printf 'nzk_ui=usr/lib/csviewer/nzk_ui (wrapped by nzk_ui/target/release/nzk_ui)\n'
   printf 'frontend=usr/share/csviewer/frontend/{index.html,static/style.css}\n'
+  printf 'modules:\n%s\n' "$("$BIN" --modules 2>/dev/null | sed 's/^/  /')"
   printf 'engine=none — no webkit/gtk/jsc/soup in ldd; no JS runtime\n'
   printf 'sha256:usr/bin/%s=%s\n' "$APP_BIN" "$(sha256_of "$APPDIR/usr/bin/$APP_BIN")"
   printf 'sha256:usr/lib/csviewer/nzk_ui=%s\n' "$(sha256_of "$APPDIR/usr/lib/csviewer/nzk_ui")"

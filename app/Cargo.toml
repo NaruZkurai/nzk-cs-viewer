@@ -33,7 +33,7 @@ pollster = "0.4"
 serde_json = "1"
 # The VSCode-like source IDE pane lives in its own repo and is pinned to a
 # commit (the host supplies the graph through its `Language` trait).
-nzkide-module = { git = "https://github.com/NaruZkurai/nzk-cs-nzkide_module.git", rev = "e4f104fe901d2f0a9db2886b935d4864ca66e59e" }
+nzkide-module = { git = "https://github.com/NaruZkurai/nzk-cs-nzkide_module.git", rev = "a204c5bc7df1437d17b04e83a62bc14f26320d75" }
 # The Scratch puzzle-piece pane lives in its own repo; it has no csgraph
 # knowledge, only host-neutral data.
 scratch-rs-ide-addon = { git = "https://github.com/NaruZkurai/nzk-csViewer-scratch_rs_ide_addon.git", rev = "d5491fef11bfb08653c668241a4415f07ff1659f" }

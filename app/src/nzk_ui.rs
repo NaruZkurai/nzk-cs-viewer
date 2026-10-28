@@ -6425,8 +6425,11 @@ mod dispatch_tests {
         // token moved 625a8f4079e9f1eb -> 183b55165755a539. Re-measured from a
         // real `nzk_ui --serve` render with no `--facts` document (exactly the
         // reproduction above).
+        // RE-PINNED (CsViewerGitRepo layout): the nzk_ui child is now built
+        // in-tree by the toolkit builder, so this test exercises the real
+        // render instead of skipping. Re-measured from that binary.
         assert!(
-            tsv.contains("@frame\t1600\t1000\t183b55165755a539"),
+            tsv.contains("@frame\t1600\t1000\t72658620ff120aeb"),
             "the closed-picker frame token moved; the picker must publish NOTHING \
              while shut. Got:\n{tsv}"
         );
