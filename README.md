@@ -87,8 +87,13 @@ cargo test --workspace
 
 The in-tree unit tests are self-contained. A few host tests exercise a real
 project fixture corpus; when that optional fixture is not present they print a
-skip line and pass. The heavier smoke/screenshot/parity harness is maintained
-in a separate private repository, not here.
+skip line and pass.
+
+The heavier smoke/screenshot/parity harness is an **optional, development-only
+companion repository**, not a build dependency:
+[nzk-cs-viewer-testing-files-only](https://github.com/NaruZkurai/nzk-cs-viewer-testing-files-only).
+Clone it beside this checkout and run its `./run-all.sh` if you want those
+gates; the viewer builds and tests fine without it.
 
 ## Packaging
 

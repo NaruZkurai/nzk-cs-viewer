@@ -25,3 +25,10 @@ opt-level = "s"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# nzkide-module is pinned to a commit of this repository for `csgraph-core`.
+# When the host builds it in-tree, use the workspace's own engine package
+# instead of a second copy from the same commit, so the host and the IDE pane
+# share one `csgraph_core` type identity.
+[patch."https://github.com/NaruZkurai/nzk-cs-viewer.git"]
+csgraph-core = { path = "core" }
