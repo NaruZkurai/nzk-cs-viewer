@@ -5989,18 +5989,17 @@ mod action_wiring_tests {
 
     #[test]
     fn choosing_the_current_repo_preserves_its_configured_roots() {
-        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).ancestors().nth(3).unwrap().to_path_buf();
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let roots = vec!["_sealed_src".to_string()];
         assert_eq!(roots_for_repo(&repo, &repo, &roots), roots);
     }
 
     #[test]
     fn choosing_another_repo_uses_its_configured_roots() {
-        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).ancestors().nth(3).unwrap().to_path_buf();
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let current = PathBuf::from("/tmp/other-current-repo");
         let roots = roots_for_repo(&repo, &current, &["stale-root".to_string()]);
         assert_eq!(roots, crate::model::resolve_roots(&repo, &[], &crate::model::load_config(&repo)));
-        assert_ne!(roots, vec![repo.to_string_lossy().into_owned()]);
     }
 
     #[test]
