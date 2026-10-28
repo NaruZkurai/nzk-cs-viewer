@@ -45,6 +45,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
+use crate::guard::WriteScope;
 use crate::index::{sha256_hex, Index};
 use crate::model;
 
@@ -150,6 +151,13 @@ pub(crate) fn iget(args: &Value, key: &str, default: i64) -> i64 {
 
 pub(crate) fn bget(args: &Value, key: &str, default: bool) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(default)
+}
+
+/// The explicit, loud opt-in that widens a write past the configured indexed
+/// root(s). Denial is the default; a caller must spell this out per call.
+/// See [`crate::guard::WriteScope::check_optin`].
+pub(crate) fn allow_outside_root(args: &Value) -> bool {
+    bget(args, "allow_outside_root", false) || bget(args, "allowOutsideRoot", false)
 }
 
 /// A `files`/`scope` argument: an array of strings or a comma-separated string.
@@ -1427,12 +1435,15 @@ fn apply_ops(
     index: &Index,
     ops: &LineOps,
     verify_before: bool,
+    allow_outside_root: bool,
 ) -> Result<(Vec<String>, Vec<Value>), String> {
+    let scope = WriteScope::for_index(index);
     let mut written: Vec<String> = Vec::new();
     let mut stale: Vec<Value> = Vec::new();
     for (file, file_ops) in ops {
         let abs = repo_abs(index, file)
             .ok_or_else(|| format!("refusing to write outside the indexed repo: {file}"))?;
+        scope.check_optin(&abs, allow_outside_root)?;
         let text = fs::read_to_string(&abs).map_err(|e| format!("read {}: {e}", abs.display()))?;
         let src: Vec<String> = text.split('\n').map(str::to_string).collect();
         let mut out: Vec<String> = Vec::with_capacity(src.len());
@@ -1765,7 +1776,7 @@ fn rename_symbol(index: &mut Index, args: &Value) -> Value {
     let mut stale: Vec<Value> = Vec::new();
     let mut write_error: Option<String> = None;
     if apply && !ops.is_empty() {
-        match apply_ops(index, &ops, true) {
+        match apply_ops(index, &ops, true, allow_outside_root(args)) {
             Ok((w, s)) => {
                 applied = true;
                 written = w;
@@ -1996,7 +2007,7 @@ fn qualify_symbols(index: &mut Index, args: &Value) -> Value {
     let mut stale: Vec<Value> = Vec::new();
     let mut write_error: Option<String> = None;
     if apply && !ops.is_empty() {
-        match apply_ops(index, &ops, true) {
+        match apply_ops(index, &ops, true, allow_outside_root(args)) {
             Ok((w, s)) => {
                 applied = true;
                 written = w;
@@ -2062,8 +2073,20 @@ fn expand_namespace(index: &mut Index, args: &Value) -> Value {
 
     // With a destination this is a thin delegate onto the existing reorg write
     // path, grouped by namespace. That path already owns its own destination
-    // and overwrite semantics.
+    // and overwrite semantics; the central scope is applied here too, because
+    // this route carries no `Index` inside `Reorg::write_tree`.
     if let Some(dest) = sget(args, "dest") {
+        if let Err(e) = WriteScope::for_index(index)
+            .check_optin(Path::new(dest), allow_outside_root(args))
+        {
+            return json!({
+                "ok": false,
+                "delegated": true,
+                "dest": dest,
+                "applied": false,
+                "error": e,
+            });
+        }
         let spec = json!({"group": "namespace"});
         let result = index.reorg(Some(&spec), "write", Some(dest), true);
         let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
@@ -2170,7 +2193,7 @@ fn expand_namespace(index: &mut Index, args: &Value) -> Value {
     let mut stale: Vec<Value> = Vec::new();
     let mut write_error: Option<String> = None;
     if apply && !ops.is_empty() {
-        match apply_ops(index, &ops, true) {
+        match apply_ops(index, &ops, true, allow_outside_root(args)) {
             Ok((w, s)) => {
                 applied = true;
                 written = w;
@@ -2211,7 +2234,15 @@ fn expand_namespace(index: &mut Index, args: &Value) -> Value {
 /// Resolve a caller-supplied path to an absolute path confined to the indexed
 /// repo. The parent directory must exist and canonicalise inside the root, and
 /// an existing symlink at the target is refused outright (no symlink escape).
-fn resolve_write_target(index: &Index, raw: &str) -> Result<PathBuf, String> {
+///
+/// The central [`WriteScope`] guard runs first: a destination outside the
+/// indexed root(s) is refused unless `allow_outside_root`, and a destination
+/// inside an engine/Unity-managed directory is always refused.
+fn resolve_write_target(
+    index: &Index,
+    raw: &str,
+    allow_outside_root: bool,
+) -> Result<PathBuf, String> {
     if raw.trim().is_empty() {
         return Err("path must be a non-empty string".to_string());
     }
@@ -2225,6 +2256,9 @@ fn resolve_write_target(index: &Index, raw: &str) -> Result<PathBuf, String> {
     } else {
         root.join(p)
     };
+    // Scope first, so a managed directory or an out-of-root destination is
+    // named precisely even when its parent does not exist yet.
+    WriteScope::for_index(index).check_optin(&abs, allow_outside_root)?;
     if let Ok(md) = fs::symlink_metadata(&abs) {
         if md.file_type().is_symlink() {
             return Err(format!("refusing to write through a symlink: {raw}"));
@@ -2302,7 +2336,7 @@ fn write_file(index: &mut Index, args: &Value) -> Value {
     let apply = bget(args, "apply", false);
     let expected = sget(args, "expected_sha256").map(|s| s.trim().to_lowercase());
 
-    let target = match resolve_write_target(index, &raw_path) {
+    let target = match resolve_write_target(index, &raw_path, allow_outside_root(args)) {
         Ok(t) => t,
         Err(e) => return json!({"ok": false, "error": e}),
     };
@@ -2597,7 +2631,14 @@ fn refuse_copy_symlink_path(index: &Index, path: &Path, raw: &str) -> Result<(),
 /// Resolve a copy destination that may not exist yet. Refuses `..` escapes,
 /// absolute paths outside the repo, and any symlink on the destination or in its
 /// existing parent chain. Returns `(absolute, display)`.
-fn resolve_copy_dest(index: &Index, raw: &str) -> Result<(PathBuf, String), String> {
+///
+/// The central [`WriteScope`] guard additionally confines the destination to
+/// the indexed root(s) and refuses engine/Unity-managed directories.
+fn resolve_copy_dest(
+    index: &Index,
+    raw: &str,
+    allow_outside_root: bool,
+) -> Result<(PathBuf, String), String> {
     if raw.trim().is_empty() {
         return Err("destination path must be a non-empty string".to_string());
     }
@@ -2616,6 +2657,7 @@ fn resolve_copy_dest(index: &Index, raw: &str) -> Result<(PathBuf, String), Stri
     if !inside(&abs) {
         return Err(format!("refusing to write outside the indexed repo: {raw}"));
     }
+    WriteScope::for_index(index).check_optin(&abs, allow_outside_root)?;
     refuse_copy_symlink_path(index, &abs, raw)?;
     let display = index.display(&abs);
     Ok((abs, display))
@@ -3155,6 +3197,19 @@ fn recover_one_copy_journal(index: &Index, journal: &Path, apply: bool) -> CopyR
                 continue;
             }
         };
+        // Recovery is a write path too: a journal entry that names a
+        // managed directory (or a target outside the indexed root) is refused
+        // rather than restored into it.
+        if let Err(err) = WriteScope::for_index(index).check(&target) {
+            out.plan.push(json!({
+                "journal": display, "action": "refuse", "path": target_rel,
+                "reason": err,
+            }));
+            out.errors.push(format!(
+                "{display}: journal entry {target_rel} is outside the write scope"
+            ));
+            continue;
+        }
         let existed = match e.get("existed").and_then(Value::as_bool) {
             Some(b) => b,
             None => {
@@ -3562,7 +3617,7 @@ fn copy_path(index: &mut Index, args: &Value) -> Value {
         Ok(v) => v,
         Err(e) => return json!({"ok": false, "tool": "copy_path", "error": e}),
     };
-    let (to_abs, to_display) = match resolve_copy_dest(index, &to_raw) {
+    let (to_abs, to_display) = match resolve_copy_dest(index, &to_raw, allow_outside_root(args)) {
         Ok(v) => v,
         Err(e) => return json!({"ok": false, "tool": "copy_path", "error": e}),
     };
@@ -3666,6 +3721,11 @@ fn copy_path(index: &mut Index, args: &Value) -> Value {
     // Destination collisions. Dry run and apply both refuse identically here.
     let mut collisions: Vec<String> = Vec::new();
     for f in files.iter_mut() {
+        // Every per-file destination of a tree copy must pass the central write
+        // scope too, so a managed directory *inside* the copied tree is refused.
+        if let Err(e) = WriteScope::for_index(index).check_optin(&f.to_abs, allow_outside_root(args)) {
+            return json!({"ok": false, "tool": "copy_path", "error": e});
+        }
         if let Err(e) = refuse_copy_symlink_path(index, &f.to_abs, &f.to_display) {
             return json!({"ok": false, "tool": "copy_path", "error": e});
         }
@@ -3722,6 +3782,11 @@ fn copy_path(index: &mut Index, args: &Value) -> Value {
     let mut dirs_abs: BTreeSet<PathBuf> = BTreeSet::new();
     for seed in &dir_seeds {
         seed_copy_dir(seed, &root, &root_c, &mut dirs_abs);
+    }
+    for d in &dirs_abs {
+        if let Err(e) = WriteScope::for_index(index).check_optin(d, allow_outside_root(args)) {
+            return json!({"ok": false, "tool": "copy_path", "error": e});
+        }
     }
     let dirs: Vec<String> = dirs_abs.iter().map(|d| index.display(d)).collect();
 
@@ -4023,6 +4088,8 @@ fn apply_edits(index: &mut Index, args: &Value) -> Value {
     let mut originals: BTreeMap<String, String> = BTreeMap::new();
     let mut paths: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut reports: Vec<Value> = Vec::new();
+    let scope = WriteScope::for_index(index);
+    let optin = allow_outside_root(args);
     for spec in &specs {
         if !working.contains_key(&spec.file) {
             let target = match repo_abs(index, &spec.file) {
@@ -4032,6 +4099,9 @@ fn apply_edits(index: &mut Index, args: &Value) -> Value {
                         "error": format!("refusing to edit outside the indexed repo: {}", spec.file)})
                 }
             };
+            if let Err(e) = scope.check_optin(&target, optin) {
+                return json!({"ok": false, "error": e});
+            }
             let text = match fs::read_to_string(&target) {
                 Ok(t) => t,
                 Err(e) => {
@@ -4189,7 +4259,15 @@ fn lexical_normalize(p: &Path) -> PathBuf {
 /// inside the indexed repo and its nearest existing ancestor must canonicalise
 /// inside the root, so a symlinked directory cannot escape. Returns
 /// `(absolute path, display path, already exists)`.
-pub(crate) fn resolve_move_target(index: &Index, raw: &str) -> Result<(PathBuf, String, bool), String> {
+///
+/// The central [`WriteScope`] guard additionally confines the destination to
+/// the indexed root(s) and refuses engine/Unity-managed directories; only an
+/// explicit `allow_outside_root` widens the root.
+pub(crate) fn resolve_move_target(
+    index: &Index,
+    raw: &str,
+    allow_outside_root: bool,
+) -> Result<(PathBuf, String, bool), String> {
     if raw.trim().is_empty() {
         return Err("destination path must be a non-empty string".to_string());
     }
@@ -4203,6 +4281,7 @@ pub(crate) fn resolve_move_target(index: &Index, raw: &str) -> Result<(PathBuf, 
     if !abs.starts_with(&root_c) && !abs.starts_with(root) {
         return Err(format!("refusing to write outside the indexed repo: {raw}"));
     }
+    WriteScope::for_index(index).check_optin(&abs, allow_outside_root)?;
     let mut anc = abs.clone();
     while !anc.exists() {
         match anc.parent() {
@@ -4615,6 +4694,10 @@ fn move_decls(index: &Index, args: &Value) -> Value {
     }
     let apply = bget(args, "apply", false);
     let allow_invalid = bget(args, "allow_invalid", false);
+    // One scope for the whole call; the move destination and every file the
+    // batch rewrites must pass it before anything is staged.
+    let scope = WriteScope::for_index(index);
+    let optin = allow_outside_root(args);
     let to = sget(args, "to").map(str::to_string);
     let dest_raw = move_target_path(args);
     if to.is_none() && dest_raw.is_none() {
@@ -5053,7 +5136,7 @@ fn move_decls(index: &Index, args: &Value) -> Value {
         if let Some(cn) = class_node {
             let cfile = str_of(cn, "file").to_string();
             if let Some(nf) = &dest_raw {
-                let (_, ndisp, _) = match resolve_move_target(index, nf) {
+                let (_, ndisp, _) = match resolve_move_target(index, nf, optin) {
                     Ok(x) => x,
                     Err(e) => return json!({"ok": false, "error": e}),
                 };
@@ -5068,11 +5151,14 @@ fn move_decls(index: &Index, args: &Value) -> Value {
                 Some(p) => p,
                 None => return json!({"ok": false, "error": format!("class {class_full} is outside the repo")}),
             };
+            if let Err(e) = scope.check_optin(&_dabs, optin) {
+                return json!({"ok": false, "error": e});
+            }
             ddisp = cfile.clone();
             dexisted = true;
             anchor = cn.get("endLine").and_then(Value::as_i64).filter(|l| *l > 0);
         } else if let Some(nf) = &dest_raw {
-            match resolve_move_target(index, nf) {
+            match resolve_move_target(index, nf, optin) {
                 Ok(x) => {
                     _dabs = x.0;
                     ddisp = x.1;
@@ -5086,6 +5172,9 @@ fn move_decls(index: &Index, args: &Value) -> Value {
                 Some(p) => p,
                 None => return json!({"ok": false, "error": format!("{} is outside the repo", m.file)}),
             };
+            if let Err(e) = scope.check_optin(&_dabs, optin) {
+                return json!({"ok": false, "error": e});
+            }
             ddisp = m.file.clone();
             dexisted = true;
             anchor = None;
@@ -5145,7 +5234,7 @@ fn move_decls(index: &Index, args: &Value) -> Value {
         }
     } else {
         let raw = dest_raw.clone().unwrap_or_default();
-        let (_dabs, ddisp, dexisted) = match resolve_move_target(index, &raw) {
+        let (_dabs, ddisp, dexisted) = match resolve_move_target(index, &raw, optin) {
             Ok(x) => x,
             Err(e) => return json!({"ok": false, "error": e}),
         };
@@ -5308,6 +5397,9 @@ fn move_decls(index: &Index, args: &Value) -> Value {
                 return json!({"ok": false, "error": format!("refusing to write outside the indexed repo: {file}")})
             }
         };
+        if let Err(e) = scope.check_optin(&abs, optin) {
+            return json!({"ok": false, "error": e});
+        }
         writes.push(MoveFile {
             display: file.clone(),
             abs,
@@ -5317,7 +5409,7 @@ fn move_decls(index: &Index, args: &Value) -> Value {
         });
     }
     for (display, content) in &new_files {
-        let (abs, _, _) = match resolve_move_target(index, display) {
+        let (abs, _, _) = match resolve_move_target(index, display, optin) {
             Ok(x) => x,
             Err(e) => return json!({"ok": false, "error": e}),
         };
@@ -6349,6 +6441,192 @@ mod tests {
     }
 
     const SIMPLE: &str = "namespace N {\n public class C {\n  public int A() { return B(); }\n  public int B() { return 2; }\n }\n}\n";
+
+    /// A Unity-shaped repo whose configured indexed root is
+    /// `Assets/NZK toolkit v5`, plus the managed directories Unity itself owns.
+    /// The engine must confine every write to that root and never touch
+    /// `Library/` or `ProjectSettings/`.
+    fn unity_indexed(tag: &str, files: &[(&str, &str)]) -> (PathBuf, Index) {
+        let dir = std::env::temp_dir().join(format!(
+            "csgraph-guard-edit-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        for d in ["Assets/NZK toolkit v5", "Assets/Other", "Library", "ProjectSettings"] {
+            fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        for (name, text) in files {
+            let p = dir.join(name);
+            if let Some(par) = p.parent() {
+                fs::create_dir_all(par).unwrap();
+            }
+            fs::write(p, text).unwrap();
+        }
+        let mut ix = Index::new(dir.clone());
+        ix.build(
+            &["Assets/NZK toolkit v5".to_string()],
+            &["Library".to_string(), "ProjectSettings".to_string()],
+            &Config::default(),
+        );
+        assert!(ix.indexed, "fixture must index");
+        (dir, ix)
+    }
+
+    #[test]
+    fn write_file_refuses_managed_dirs_and_out_of_root_unless_opted_in() {
+        let (dir, mut ix) = unity_indexed(
+            "write-scope",
+            &[("Assets/NZK toolkit v5/Test.cs", "namespace N { public class Test { } }\n")],
+        );
+        // Unity-managed directories inside the repo (and inside the root) are
+        // refused, and nothing lands on disk.
+        for rel in ["Library/foo.txt", "ProjectSettings/ProjectSettings.asset"] {
+            let r = call(
+                &mut ix,
+                "write_file",
+                json!({"path": rel, "content": "x", "create": true, "apply": true}),
+            );
+            assert_eq!(r["ok"], false, "{rel}: {r}");
+            let err = r["error"].as_str().unwrap_or("");
+            assert!(err.starts_with("write-scope refusal:"), "{rel}: {err}");
+            assert!(err.contains(rel), "the refusal must name {rel}: {err}");
+            assert!(!dir.join(rel).exists(), "a refused write must not land: {rel}");
+        }
+        // Inside the repo but outside the indexed root: refused by default…
+        let r = call(
+            &mut ix,
+            "write_file",
+            json!({"path": "Assets/Other/file.cs",
+                   "content": "namespace N { public class D { } }\n",
+                   "create": true, "apply": true}),
+        );
+        assert_eq!(r["ok"], false, "{r}");
+        let err = r["error"].as_str().unwrap_or("");
+        assert!(err.contains("outside the indexed root(s)"), "{err}");
+        assert!(err.contains("allow_outside_root=true"), "{err}");
+        assert!(!dir.join("Assets/Other/file.cs").exists());
+        // …and allowed only with the explicit, loud opt-in.
+        let r = call(
+            &mut ix,
+            "write_file",
+            json!({"path": "Assets/Other/file.cs",
+                   "content": "namespace N { public class D { } }\n",
+                   "create": true, "apply": true, "allow_outside_root": true}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(dir.join("Assets/Other/file.cs").exists());
+        // The opt-in never widens past a managed directory.
+        let r = call(
+            &mut ix,
+            "write_file",
+            json!({"path": "Library/foo.txt", "content": "x", "create": true,
+                   "apply": true, "allow_outside_root": true}),
+        );
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(
+            r["error"].as_str().unwrap_or("").contains("engine-managed directory"),
+            "{r}"
+        );
+        // An ordinary write inside the root still works.
+        let r = call(
+            &mut ix,
+            "write_file",
+            json!({"path": "Assets/NZK toolkit v5/Test.cs",
+                   "content": "namespace N { public class Test { public int V() { return 1; } } }\n",
+                   "apply": true}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(
+            fs::read_to_string(dir.join("Assets/NZK toolkit v5/Test.cs"))
+                .unwrap()
+                .contains("V()"),
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_path_refuses_managed_and_out_of_root_destinations() {
+        let (dir, mut ix) = unity_indexed(
+            "copy-scope",
+            &[("Assets/NZK toolkit v5/Src.cs", SIMPLE)],
+        );
+        for dest in ["Library/copied.cs", "ProjectSettings/copied.cs"] {
+            let r = call(
+                &mut ix,
+                "copy_path",
+                json!({"from": "Assets/NZK toolkit v5/Src.cs", "to": dest, "apply": true}),
+            );
+            assert_eq!(r["ok"], false, "{dest}: {r}");
+            let err = r["error"].as_str().unwrap_or("");
+            assert!(err.starts_with("write-scope refusal:"), "{dest}: {err}");
+            assert!(!dir.join(dest).exists(), "a refused copy must not land: {dest}");
+        }
+        // A tree copy whose *destination* is fine but which carries a managed
+        // directory inside it is refused per file.
+        fs::create_dir_all(dir.join("Assets/NZK toolkit v5/Tree/Library")).unwrap();
+        fs::write(dir.join("Assets/NZK toolkit v5/Tree/Library/inner.cs"), SIMPLE).unwrap();
+        let r = call(
+            &mut ix,
+            "copy_path",
+            json!({"from": "Assets/NZK toolkit v5/Tree", "to": "Assets/NZK toolkit v5/TreeCopy",
+                   "apply": true}),
+        );
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(!dir.join("Assets/NZK toolkit v5/TreeCopy/Library/inner.cs").exists());
+        // In-repo but out of root needs the opt-in.
+        let r = call(
+            &mut ix,
+            "copy_path",
+            json!({"from": "Assets/NZK toolkit v5/Src.cs", "to": "Assets/Other/Copy.cs",
+                   "apply": true}),
+        );
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(
+            r["error"].as_str().unwrap_or("").contains("outside the indexed root(s)"),
+            "{r}"
+        );
+        // An ordinary in-root copy still works.
+        let r = call(
+            &mut ix,
+            "copy_path",
+            json!({"from": "Assets/NZK toolkit v5/Src.cs", "to": "Assets/NZK toolkit v5/Copy.cs",
+                   "apply": true}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(dir.join("Assets/NZK toolkit v5/Copy.cs").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn move_decls_refuses_managed_and_out_of_root_destinations() {
+        let (dir, mut ix) =
+            unity_indexed("move-scope", &[("Assets/NZK toolkit v5/Src.cs", MOVE_SRC)]);
+        for nf in ["Library/C.cs", "Assets/Other/C.cs"] {
+            let r = call(
+                &mut ix,
+                "move_decls",
+                json!({"like": ["C"], "class": "VF", "newfile": nf, "apply": true}),
+            );
+            assert_eq!(r["ok"], false, "{nf}: {r}");
+            let err = r["error"].as_str().unwrap_or("");
+            assert!(err.starts_with("write-scope refusal:"), "{nf}: {err}");
+            assert!(!dir.join(nf).exists(), "a refused move must not land: {nf}");
+        }
+        // An ordinary in-root move still works.
+        let r = call(
+            &mut ix,
+            "move_decls",
+            json!({"like": ["C"], "class": "VF", "newfile": "Assets/NZK toolkit v5/C.cs",
+                   "apply": true}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(dir.join("Assets/NZK toolkit v5/C.cs").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn fuzzy_search_ranks_deterministically_and_filters_by_kind() {

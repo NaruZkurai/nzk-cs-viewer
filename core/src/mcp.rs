@@ -8,20 +8,22 @@
 //! is the primary/default); each slot keeps its own fixed pool of `threads`
 //! worker indices over its own `Mutex<Index>` replicas. The primary is
 //! pre-indexed at startup when a `--root` was given; every other repo starts
-//! cold and builds on its first call. Every tool call may carry a `repo`
-//! argument (1-based index, path, or unique basename; absent = primary): the
-//! server resolves it against the bound set, **strips it from the argument
-//! map**, and dispatches against that repo's slots only — so a call with no
-//! `repo` argument behaves exactly as before. Worker threads pull requests off
-//! an unbounded job channel, so the stdio read loop never blocks and protocol
-//! methods (`initialize`, `ping`, `tools/list`) stay responsive while a long
-//! `tools/call` is in flight. Reads only ever need one slot, so two independent
-//! reads run on two slots at once. The one route family that changes index
-//! state (`/api/index`, `/api/index/cancel`) is broadcast under that repo's
-//! write gate to every one of its slots, so every replica answers from the same
-//! built graph afterwards, and other repos are untouched. The non-index writes
-//! (`/api/settings`, `/api/viewer_state`, `/api/reorg`) either write a file
-//! shared by all slots or are pure, so they run once.
+//! cold and builds on its first call. The MCP-only `bind_repo` tool can add
+//! another repo at runtime (and index it synchronously, waiting for the build).
+//! Every tool call may carry a `repo` argument (1-based index, path, or unique
+//! basename; absent = primary): the server resolves it against the bound set,
+//! **strips it from the argument map**, and dispatches against that repo's
+//! slots only — so a call with no `repo` argument behaves exactly as before.
+//! Worker threads pull requests off an unbounded job channel, so the stdio read
+//! loop never blocks and protocol methods (`initialize`, `ping`, `tools/list`)
+//! stay responsive while a long `tools/call` is in flight. Reads only ever need
+//! one slot, so two independent reads run on two slots at once. The one route
+//! family that changes index state (`/api/index`, `/api/index/cancel`) is
+//! broadcast under that repo's write gate to every one of its slots, so every
+//! replica answers from the same built graph afterwards, and other repos are
+//! untouched. The non-index writes (`/api/settings`, `/api/viewer_state`,
+//! `/api/reorg`) either write a file shared by all slots or are pure, so they
+//! run once.
 //!
 //! Every tool call is routed through the same [`crate::api::handle_payload`] /
 //! [`crate::api::handle`] the HTTP host uses, so the MCP surface is the whole
@@ -33,7 +35,7 @@
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -167,8 +169,15 @@ pub fn initialize_result(protocol: Option<&str>, threads: usize) -> Value {
             "error listing every bound repo. `index` rebuilds the selected ",
             "repo's graph only, `index_cancel` cancels the selected repo's ",
             "build only, and `workspace` lists every bound repo with its index, ",
-            "roots, loaded flag and slot count. `reorg` mutates a destination ",
-            "tree, `settings`/`viewer_state` write state."
+            "roots, loaded flag and slot count. `bind_repo {path, roots}` adds ",
+            "a new repo at runtime and waits for its build by default, so an ",
+            "agent can index any directory it was given. `help {topic}` returns ",
+            "overview/index/repos/find/tools/writes/viewer guidance and the live ",
+            "bound set. `reorg` mutates a destination ",
+            "tree, `settings`/`viewer_state` write state. `viewer_instances` and ",
+            "`viewer_pov` are read-only: they find a running viewer (even one ",
+            "owned by another OS user) and return its live selection, box ",
+            "selection and IDE context, with honest staleness."
         ),
     })
 }
@@ -311,8 +320,63 @@ pub fn tools() -> Vec<Value> {
              json!({"files": {"type": "string", "description": "1/true to list each project's files."},
                     "file": {"type": "string", "description": "Per-file project lookup."}}), &[]),
         tool("viewer_state", "GET /api/viewer_state — read the saved viewer state; with a `body` \
-             argument POST it to mutate the state file (write).",
+             argument POST it to mutate the state file (write). The blob now also carries the \
+             viewer's `pov` (Monaco text selection, graph box selection, loose IDE context) when \
+             the running viewer has published one.",
              json!({"body": {"type": "object", "description": "When present, POST this object instead of GET."}}), &[]),
+        tool("viewer_instances", "GET /api/viewer_instances — READ-ONLY. Enumerate every running cs \
+             viewer discovered across OS users and roots: the `$XDG_RUNTIME_DIR/csviewer/instances` \
+             registry (records judged against /proc, stale ones labelled) plus a bounded \
+             `/proc/*/cmdline` fallback. Exactly one live instance is auto-selected; several are \
+             reported as `ambiguous` with `active:null` and the candidate list; none is an honest \
+             empty. `instance` selects one by pid or by a substring of user/repo/root/cache/state \
+             path. `discovery` says which path fired (registry|proc-scan|none).",
+             json!({"instance": {"type": "string", "description": "pid or a substring of user/repo/root/cache/state path."}}), &[]),
+        tool("viewer_pov", "GET /api/viewer_pov — READ-ONLY. The running viewer's POV: Monaco text \
+             selection (active document, cursor, every selection range + selected text, multi-cursor), \
+             graph box/marquee selection (canvas rect, node ids inside it, edges among them), and the \
+             loose IDE context (focused/selected node, tabs, panes, filters, depth, layout, whether an \
+             index is running). Reads the selected instance's viewer.json across processes and labels \
+             freshness honestly (`ageMs`, `staleAfterMs`, `live`, `stale`, `publisherAlive`); a stale \
+             snapshot is never passed off as current and a missing viewer is `pov:null`, never \
+             fabricated. `instance` picks a viewer when several are live.",
+             json!({"instance": {"type": "string", "description": "pid or a substring of user/repo/root/cache/state path."}}), &[]),
+        // -- MCP-only viewer-control family (crate::viewer; bypasses /api/*,
+        //    talks to a running viewer over its `--control` unix socket) ------
+        tool("viewer_control", "MCP-only: send ONE control command to a running viewer over its \
+             `--control` unix socket (AF_UNIX, newline-delimited JSON). This is the input half the \
+             read-only viewer tools lack: it can drive a human task (`click`, `type`, `key`, `drag`, \
+             `scroll`, `mode`, `pane`, `tab`, `window`, `select_node`, `open_source`, `find`, \
+             `edit`, `preview`, `reorg`) as well as `ping`/`state`. `op` is required, `args` is the \
+             op's object (e.g. {\"selector\":\"#modeFind\"}). The socket is discovered from the \
+             instance registry's `control` field, or passed explicitly as `path`; `instance` picks \
+             one when several viewers expose a channel. No viewer/channel is the honest \
+             {\"ok\":false,\"error\":\"no_control_channel\"} (isError), never a fake success. The \
+             viewer's reply is passed through verbatim. Write: mutates the viewer's UI state.",
+             json!({"op": {"type": "string", "description": "e.g. ping, state, click, key, type, drag, mode, pane, tab."},
+                    "args": {"type": "object", "description": "Op arguments, e.g. {\"selector\":\"#modeFind\"}."},
+                    "path": {"type": "string", "description": "Explicit control socket path (overrides discovery)."},
+                    "instance": {"type": "string", "description": "pid or registry-record substring when several control sockets exist."}}),
+             &["op"]),
+        tool("viewer_click", "MCP-only: click one chrome control in a running viewer by selector \
+             (same selector vocabulary as the app's chrome registry, e.g. `#modeFind`) — sugar over \
+             `viewer_control` {op:\"click\",args:{selector}}. Returns the viewer's ack (normally the \
+             post-action `pov`) and the honest `no_control_channel` error when no viewer exposes a \
+             control channel. Canvas clicks: use `viewer_control` with {op:\"click\",args:{x,y,canvas:true}}. \
+             Write: mutates the viewer's UI state.",
+             json!({"selector": {"type": "string"},
+                    "path": {"type": "string", "description": "Explicit control socket path."},
+                    "instance": {"type": "string", "description": "pid or registry-record substring."}}),
+             &["selector"]),
+        tool("viewer_observe", "MCP-only: read the running viewer's channel status snapshot — \
+             sugar over `viewer_control` {op:\"state\"} (the plan's `viewer_observe`). Returns the \
+             viewer's own state/POV payload plus the honest `no_control_channel` error when no \
+             viewer exposes a control channel; it never falls back to a different repo's cached \
+             viewer_state. Read-only.",
+             json!({"full": {"type": "boolean", "description": "Ask for the full snapshot when supported."},
+                    "path": {"type": "string", "description": "Explicit control socket path."},
+                    "instance": {"type": "string", "description": "pid or registry-record substring."}}),
+             &[]),
         tool("settings", "GET /api/settings — read UI settings; with a `body` argument POST it to \
              mutate the settings file (write).",
              json!({"body": {"type": "object", "description": "When present, POST this object instead of GET."}}), &[]),
@@ -561,14 +625,39 @@ pub fn tools() -> Vec<Value> {
                     "to": {"type": "string", "description": "New name (rename) or new declared type (retype)."},
                     "include_declarations": {"type": "boolean", "default": true, "description": "Include the declaration's own lines in the rename edit plan."}}),
              &["op", "to"]),
+        tool("bind_repo", "MCP-only: bind an ADDITIONAL repository directory at runtime and, by \
+             default, index it SYNCHRONOUSLY — the call returns only after the build finishes, so \
+             the very next read can use it. `path` (required) is the repo root, absolute or \
+             relative to the server's cwd; `roots` is relative to `path` and defaults to [\".\"] \
+             (index the whole tree); `index:false` binds cold (lazy build on the first call); \
+             `reindex:true` rebuilds an already-bound repo. Binding the same canonical path twice \
+             is idempotent (`reused:true`). The returned 1-based `index`/`selector` is accepted as \
+             the `repo` argument on every other tool. `workspace` lists the bound set.",
+             json!({"path": {"type": "string", "description": "Repository root directory to bind (absolute, or relative to the server cwd)."},
+                    "roots": {"type": ["array", "string"], "description": "Roots to index, relative to `path` (default [\".\"])."},
+                    "index": {"type": "boolean", "default": true, "description": "Build the graph now and wait for it (false = bind cold)."},
+                    "reindex": {"type": "boolean", "default": false, "description": "Rebuild when the path is already bound."}}),
+             &["path"]),
+        tool("help", "MCP-only: usage help for this csgraph server. `topic` (default \"overview\") \
+             is one of overview|index|repos|find|tools|writes|viewer. Returns `{ok, topic, topics, \
+             text, repos, tools?}` — `text` is readable guidance, `repos` is the live bound set, \
+             and `tools` (topic=tools) is the name/required/description catalogue. Start here when \
+             unsure how to index a directory, select a repo, or find/read code; `index` documents \
+             the `bind_repo`/`index`/wait workflow and `repos` the `repo` selector. Read-only.",
+             json!({"topic": {"type": "string",
+                        "enum": ["overview", "index", "repos", "find", "tools", "writes", "viewer"],
+                        "default": "overview",
+                        "description": "Help topic; default overview."}}),
+             &[]),
         tool("workspace", "MCP-only: report the exact scope this server holds. One process may be \
              bound to SEVERAL repos (`--repo` is repeatable; index 0 is the primary/default); every \
              tool takes an optional `repo` argument (1-based index, path, or unique basename; absent \
-             = primary). `--root` is repeatable and global, and `index {roots:[...], repo:...}` \
-             re-indexes the selected repo over different roots. Returns `{ok, repo` (=primary)`, \
-             roots, indexed, files, nodes, servers, selected, defaultRepo, repos:[{index, repo, \
-             roots, loaded, slots, default}], scoping:{multiRoot, reScope, repoSelector}, \
-             limitation}`. Not an edit tool (no `/api/edit` entry), read-only.",
+             = primary). `--root` is repeatable and global, `index {roots:[...], repo:...}` \
+             re-indexes the selected repo over different roots, and `bind_repo {path, roots, index}` \
+             adds a repo at runtime and (by default) waits for its build. Returns `{ok, repo` \
+             (=primary)`, roots, indexed, files, nodes, servers, selected, defaultRepo, \
+             repos:[{index, repo, roots, loaded, slots, default}], scoping:{multiRoot, reScope, \
+             repoSelector}, limitation}`. Not an edit tool (no `/api/edit` entry), read-only.",
              json!({}), &[]),
         tool("parse_check", "MCP-only validity gate: runs the local Roslyn parse check \
              (`core/src/compile_check.rs`, the same call as `csgraph parse-check`) over the indexed \
@@ -686,6 +775,8 @@ fn resolve_call(name: &str, args: &Value) -> Result<Call, String> {
         }
         "reorg" => Call { method: "POST".into(), path: "/api/reorg".into(), query: json!({}), body: Some(a.clone()) },
         "browse" => get("/api/browse"),
+        "viewer_instances" => get("/api/viewer_instances"),
+        "viewer_pov" => get("/api/viewer_pov"),
         "search" => { require("q")?; get("/api/search") }
         "node" => { require("id")?; get("/api/node") }
         "relation" => { require("node")?; require("key")?; get("/api/relation") }
@@ -766,6 +857,23 @@ fn tool_error(message: impl Into<String>) -> Value {
 /// [`resolve_call`] / [`dispatch_call`], so the frozen route table is untouched.
 pub fn invoke_on_index(index: &mut Index, name: &str, args: &Value) -> Value {
     let args = strip_repo(args);
+    if name == "help" {
+        let rows = vec![json!({
+            "index": 1,
+            "repo": index.repo_path().to_string_lossy().into_owned(),
+            "roots": effective_roots(index),
+            "indexed": index.indexed,
+            "loaded": index.indexed,
+            "slots": 1,
+            "default": true,
+        })];
+        return help_reply(Some(rows), &args);
+    }
+    if name == "bind_repo" {
+        return tool_error(
+            "bind_repo needs the server's bound set; it is not available on a single index",
+        );
+    }
     if name == "workspace" {
         let views = vec![RepoView {
             repo: index.repo_path().to_string_lossy().into_owned(),
@@ -844,8 +952,12 @@ impl RepoSlot {
 }
 
 struct Shared {
-    repos: Vec<RepoSlot>,
+    /// Append-only: `bind_repo` may push a new repo at runtime; an existing
+    /// repo's 1-based index never changes, so a resolved selector stays valid.
+    repos: RwLock<Vec<Arc<RepoSlot>>>,
     cfg: Config,
+    /// Worker slots per repo, used when `bind_repo` adds a new pool.
+    threads: usize,
     /// stdout is protocol-only; a lock keeps response lines from interleaving.
     out: Mutex<io::Stdout>,
 }
@@ -904,7 +1016,7 @@ fn dedupe_repo_paths(repos: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 /// A human listing of the bound repos, each with its 1-based index.
-fn repos_listing(repos: &[RepoSlot]) -> String {
+fn repos_listing(repos: &[Arc<RepoSlot>]) -> String {
     repos
         .iter()
         .enumerate()
@@ -922,7 +1034,7 @@ fn repos_listing(repos: &[RepoSlot]) -> String {
 
 /// The error for an unknown/ambiguous `repo` selector. It names every bound
 /// repo with its 1-based index so the caller can retry.
-fn repo_error(repos: &[RepoSlot], selector: &Value) -> String {
+fn repo_error(repos: &[Arc<RepoSlot>], selector: &Value) -> String {
     format!("unknown repo {selector}; bound repos: {}", repos_listing(repos))
 }
 
@@ -931,7 +1043,7 @@ fn repo_error(repos: &[RepoSlot], selector: &Value) -> String {
 /// Order: an exact canonical path (absolute, or relative to the process cwd),
 /// then a 1-based index (`"2"` or `2`), then a unique case-insensitive basename.
 /// Unknown or ambiguous is an error.
-fn resolve_repo_selector(repos: &[RepoSlot], selector: &Value) -> Result<usize, String> {
+fn resolve_repo_selector(repos: &[Arc<RepoSlot>], selector: &Value) -> Result<usize, String> {
     let n = repos.len();
     let as_index = |i: u64| -> Option<usize> {
         if i >= 1 && (i as usize) <= n {
@@ -1026,9 +1138,10 @@ fn strip_repo(args: &Value) -> Value {
 /// Strip the server-only `repo` key from an argument map and resolve it.
 fn resolve_repo_argument(shared: &Shared, args: &Value) -> Result<(usize, Value), String> {
     let stripped = strip_repo(args);
+    let repos = shared.repos.read().unwrap_or_else(|e| e.into_inner());
     match args.get("repo").filter(|v| !v.is_null()) {
         None => Ok((0, stripped)),
-        Some(sel) => Ok((resolve_repo_selector(&shared.repos, sel)?, stripped)),
+        Some(sel) => Ok((resolve_repo_selector(&repos, sel)?, stripped)),
     }
 }
 
@@ -1040,12 +1153,15 @@ fn resolve_repo_argument(shared: &Shared, args: &Value) -> Result<(usize, Value)
 /// exactly like an explicit `index`: when no global `--root` was given the
 /// build falls back to [`Config::default`]'s roots, the same roots the `index`
 /// route would use on a cold primary.
-fn ensure_loaded(shared: &Shared, idx: usize) {
-    let repo = &shared.repos[idx];
+fn ensure_loaded(shared: &Shared, repo_idx: usize) {
+    let repo = match shared.repos.read().unwrap_or_else(|e| e.into_inner()).get(repo_idx) {
+        Some(r) => r.clone(),
+        None => return,
+    };
     if repo.is_loaded() {
         return;
     }
-    if idx == 0 && shared.cfg.roots.is_empty() {
+    if repo_idx == 0 && shared.cfg.roots.is_empty() {
         return;
     }
     let mut cfg = shared.cfg.clone();
@@ -1063,6 +1179,355 @@ fn ensure_loaded(shared: &Shared, idx: usize) {
         }
     }
     repo.loaded.store(true, Ordering::SeqCst);
+}
+
+/// Build every replica of one repo with `roots`, under its write gate, and
+/// wait for the build. `force` rebuilds an already-loaded repo (`reindex`).
+/// The shared stop flag is cleared by `Index::build`, so `index_cancel` can
+/// interrupt this build and the next one starts clean.
+fn build_repo(shared: &Shared, repo: &RepoSlot, roots: &[String], force: bool) {
+    let _gate = repo.write_gate.lock().unwrap_or_else(|e| e.into_inner());
+    if repo.is_loaded() && !force {
+        return;
+    }
+    let mut cfg = shared.cfg.clone();
+    cfg.roots = roots.to_vec();
+    for slot in &repo.slots {
+        let mut index = lock_index(slot);
+        index.build(roots, &cfg.excludes, &cfg);
+    }
+    // A build ran (successful, refused, or cancelled): never rebuild it on the
+    // next read just because the caller asked to index once.
+    repo.loaded.store(true, Ordering::SeqCst);
+}
+
+/// Roots for `bind_repo`: `["."]` (the whole bound tree) unless the caller
+/// named one or more paths relative to the new repo.
+fn bind_roots(args: &Value) -> Vec<String> {
+    match args.get("roots") {
+        Some(Value::String(s)) if !s.trim().is_empty() => vec![s.clone()],
+        Some(Value::Array(items)) => {
+            let roots: Vec<String> = items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+            if roots.is_empty() { vec![".".to_string()] } else { roots }
+        }
+        _ => vec![".".to_string()],
+    }
+}
+
+/// Find a bound repo by canonical or lexical absolute path.
+fn find_bound(shared: &Shared, canonical: &std::path::Path, lex: &std::path::Path) -> Option<(usize, Arc<RepoSlot>)> {
+    let repos = shared.repos.read().unwrap_or_else(|e| e.into_inner());
+    repos
+        .iter()
+        .enumerate()
+        .find(|(_, r)| {
+            r.canonical.as_path() == canonical || r.absolute.as_path() == lex
+        })
+        .map(|(i, r)| (i, r.clone()))
+}
+
+/// The `bind_repo` payload: where the repo now sits in the bound set and how
+/// the caller can select it next.
+fn bind_reply(repo: &RepoSlot, idx: usize, reused: bool) -> Value {
+    let index = repo.primary_index();
+    let state = index.state();
+    aux_result(json!({
+        "ok": true,
+        "tool": "bind_repo",
+        "repo": repo.path.to_string_lossy().into_owned(),
+        "index": idx + 1,
+        "selector": (idx + 1).to_string(),
+        "roots": effective_roots(&index),
+        "indexed": index.indexed,
+        "files": index.file_paths().len(),
+        "nodes": index.nodes().len(),
+        "slots": repo.slots.len(),
+        "reused": reused,
+        "default": idx == 0,
+        "cancelled": state.get("cancelled").cloned().unwrap_or(Value::Bool(false)),
+        "hint": format!(
+            "pass `repo` = {} (or the repo path) to any tool",
+            idx + 1
+        ),
+    }))
+}
+
+/// Bind one additional repository at runtime and, unless `index:false`, build
+/// it synchronously. MCP-only: it changes the server's bound set, not a graph.
+fn bind_repo(shared: &Shared, args: &Value) -> Value {
+    let raw = match args.get("path").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s,
+        _ => return tool_error("argument \"path\" is required (the repository root directory)"),
+    };
+    let given = PathBuf::from(raw);
+    let abs = if given.is_absolute() {
+        given
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(&given)
+    };
+    if !std::fs::metadata(&abs).map(|m| m.is_dir()).unwrap_or(false) {
+        return tool_error(format!("not a directory: {}", abs.display()));
+    }
+    let canonical = canonical_repo(&abs);
+    let lex = absolute(&abs);
+    let roots = bind_roots(args);
+    let index_now = args.get("index").and_then(Value::as_bool).unwrap_or(true);
+    let reindex = args.get("reindex").and_then(Value::as_bool).unwrap_or(false);
+
+    if let Some((idx, repo)) = find_bound(shared, &canonical, &lex) {
+        if index_now {
+            build_repo(shared, &repo, &roots, reindex);
+        }
+        return bind_reply(&repo, idx, true);
+    }
+
+    let fresh = Arc::new(make_repo_slot(
+        abs.clone(),
+        shared.threads,
+        Arc::new(AtomicBool::new(false)),
+        &shared.cfg,
+        false,
+    ));
+    // Re-check under the write lock: two concurrent binds of one path must
+    // produce one slot, and the first index always stays the primary.
+    let (idx, repo, reused) = {
+        let mut repos = shared.repos.write().unwrap_or_else(|e| e.into_inner());
+        match repos
+            .iter()
+            .position(|r| {
+                r.canonical.as_path() == canonical || r.absolute.as_path() == lex
+            })
+        {
+            Some(i) => (i, repos[i].clone(), true),
+            None => {
+                let i = repos.len();
+                repos.push(fresh);
+                (i, repos[i].clone(), false)
+            }
+        }
+    };
+    if index_now {
+        build_repo(shared, &repo, &roots, reindex);
+    }
+    bind_reply(&repo, idx, reused)
+}
+
+// ---------------------------------------------------------------------------
+// help
+// ---------------------------------------------------------------------------
+
+/// The topics `help` accepts, in the order they are listed to callers.
+pub const HELP_TOPICS: &[&str] = &[
+    "overview", "index", "repos", "find", "tools", "writes", "viewer",
+];
+
+const HELP_OVERVIEW: &str = concat!(
+    "csgraph MCP - a C# relation-graph engine.\n",
+    "\n",
+    "Typical loop:\n",
+    "1. workspace                       -> bound repos, roots, loaded/cold state.\n",
+    "2. bind_repo {path, roots}         -> bind + build a new repo (waits for the build).\n",
+    "   index {repo, roots}             -> build/rebuild an already-bound repo (waits).\n",
+    "3. find / fuzzy_search / grep      -> locate declarations or text, repo-scoped.\n",
+    "4. source / doc / code_block       -> read code around a node or file:line.\n",
+    "5. refs / chain / decls / counts   -> usages, call chain, declarations, stats.\n",
+    "\n",
+    "Every tool accepts `repo` (1-based index, path, or unique basename; omitted =\n",
+    "primary). isError means the call was refused; routed results carry\n",
+    "{status, ok, body}.\n",
+    "\n",
+    "Topics: overview | index | repos | find | tools | writes | viewer\n",
+);
+
+const HELP_INDEX: &str = concat!(
+    "Indexing an arbitrary directory:\n",
+    "\n",
+    "  bind_repo {\"path\": \"/abs/dir\", \"roots\": [\".\"], \"index\": true}\n",
+    "\n",
+    "binds the directory as a NEW repo and, with `index:true` (the default), builds\n",
+    "every worker replica synchronously - the call returns only after the build\n",
+    "finishes. The reply carries `index` and `selector`; pass either as `repo` on\n",
+    "later calls.\n",
+    "\n",
+    "  - `roots` are relative to `path`; default [\".\"] (the whole tree).\n",
+    "  - Binding the same canonical path again -> `reused:true`, no duplicate.\n",
+    "  - `index:false` binds cold (the first routed call builds it lazily).\n",
+    "  - `reindex:true` forces a rebuild of an already-bound repo.\n",
+    "\n",
+    "Already bound? Rebuild and wait:\n",
+    "  index {\"repo\": \"<selector>\", \"roots\": [\"src\", \"Assets\"]}\n",
+    "  index_cancel {\"repo\": \"<selector>\"}   # flips the stop flag, even during a build\n",
+    "\n",
+    "Notes:\n",
+    "  - `--root` / `--exclude` on the server command line are GLOBAL defaults;\n",
+    "    an explicit `roots` list overrides them for that one build.\n",
+    "  - The first build of a large tree can exceed the MCP client's request\n",
+    "    timeout; the server keeps building. Check `workspace` or `state` after.\n",
+    "  - The graph cache lives under `<repo>/<root>/.csgraph.v2`.\n",
+);
+
+const HELP_REPOS: &str = concat!(
+    "Bound repos and the `repo` selector:\n",
+    "\n",
+    "  workspace -> {repos:[{index, repo, roots, loaded, slots, default}], ...}\n",
+    "\n",
+    "`repo` accepts:\n",
+    "  - a 1-based index: 2 or \"2\"\n",
+    "  - an absolute or cwd-relative path\n",
+    "  - a unique basename, case-insensitive\n",
+    "Omitted = index 1 (the primary/default). Unknown or ambiguous -> an error that\n",
+    "lists every bound repo. The key is consumed by the server and never reaches a\n",
+    "route.\n",
+    "\n",
+    "`bind_repo` appends to the set; existing 1-based indices never change. `index`\n",
+    "and `index_cancel` act only on the selected repo.\n",
+);
+
+const HELP_FIND: &str = concat!(
+    "Finding code:\n",
+    "  find {q}            fuzzy symbol lookup (declarations first) - usually best.\n",
+    "  fuzzy_search {q}    deterministic ranked fuzzy over full/label/name.\n",
+    "  search {q}          substring search over node name/kind.\n",
+    "  grep {pattern}      regex/text over the INDEXED corpus; rows are file:line:col.\n",
+    "  refs {q}            text usages of a symbol.\n",
+    "  definitions {scope} public/private declaration list.\n",
+    "\n",
+    "Reading the hit:\n",
+    "  source {file, line, context, mode}   mode = doc|effective|raw\n",
+    "  source {node}                        whole declaration/body for a node id\n",
+    "  doc {node}                           synthesized document for a node\n",
+    "  code_block {node|nodes|q}            compilable block with part markers\n",
+    "  decls {file|node}                    declarations for a file or node\n",
+    "  chain {id, depth, dir}               call/inheritance chain\n",
+    "  counts {q?}                          graph counts for the corpus or a symbol\n",
+    "\n",
+    "All of these accept `repo` and are read-only.\n",
+);
+
+const HELP_TOOLS: &str = concat!(
+    "Tool catalogue for this server. Each entry is {name, required, description};\n",
+    "full JSON schemas are in the MCP `tools/list` response. Routed tools mirror\n",
+    "`/api/*`; MCP-only tools are implemented in the engine.\n",
+);
+
+const HELP_WRITES: &str = concat!(
+    "Writes are DRY-RUN by default; pass \"apply\": true to write.\n",
+    "  write_file, apply_edits, rename_symbol, move_decls, qualify_symbols,\n",
+    "  expand_namespace, reformat, functionize, copy_path, reorg,\n",
+    "  settings / viewer_state (POST a body), viewer_control (drives the UI)\n",
+    "\n",
+    "Safety gates:\n",
+    "  parse_check {files}   Roslyn parse gate; ok:false with a reason if unavailable.\n",
+    "  compile_diff          candidate vs baseline diagnostics (Unity refs optional).\n",
+    "  preview_change        read-only rename/retype plan with exact edits (no apply).\n",
+    "  move_decls / reformat / functionize report `validated:\"roslyn\"` or\n",
+    "  `validated:\"skipped:<reason>\"` + `unverified:true` - never a false pass.\n",
+    "After an apply, call `index` to re-sync the graph.\n",
+);
+
+const HELP_VIEWER: &str = concat!(
+    "Running viewer (csviewer GUI):\n",
+    "  viewer_instances   discover viewers (read-only; honest empty/ambiguous).\n",
+    "  viewer_pov         live Monaco selection, graph box selection, IDE context.\n",
+    "  viewer_observe     channel state snapshot (sugar over viewer_control state).\n",
+    "  viewer_control     send one command: ping/state/click/type/key/drag/scroll/\n",
+    "                     mode/pane/tab/window/select_node/open_source/find/edit/\n",
+    "                     preview/reorg\n",
+    "  viewer_click       click one chrome control by selector (e.g. #modeFind).\n",
+    "No control channel -> {ok:false, error:\"no_control_channel\"}, never a fake\n",
+    "success.\n",
+);
+
+/// The static text for one topic, or `None` for an unknown topic.
+fn help_text(topic: &str) -> Option<&'static str> {
+    match topic {
+        "overview" => Some(HELP_OVERVIEW),
+        "index" => Some(HELP_INDEX),
+        "repos" => Some(HELP_REPOS),
+        "find" => Some(HELP_FIND),
+        "tools" => Some(HELP_TOOLS),
+        "writes" => Some(HELP_WRITES),
+        "viewer" => Some(HELP_VIEWER),
+        _ => None,
+    }
+}
+
+/// Live rows for the bound set, used by `help` so examples are concrete.
+fn repo_rows(shared: &Shared) -> Vec<Value> {
+    let repos = shared.repos.read().unwrap_or_else(|e| e.into_inner());
+    repos
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let index = r.primary_index();
+            json!({
+                "index": i + 1,
+                "repo": r.path.to_string_lossy().into_owned(),
+                "roots": effective_roots(&index),
+                "indexed": index.indexed,
+                "loaded": r.is_loaded(),
+                "slots": r.slots.len(),
+                "default": i == 0,
+            })
+        })
+        .collect()
+}
+
+/// `{name, required, description}` for every tool, with the description
+/// truncated to a readable summary (full text lives in `tools/list`).
+fn tool_catalogue() -> Vec<Value> {
+    tools()
+        .iter()
+        .map(|t| {
+            let description = t["description"].as_str().unwrap_or("");
+            let summary: String = description.chars().take(160).collect();
+            json!({
+                "name": t["name"],
+                "required": t["inputSchema"]["required"],
+                "description": summary,
+            })
+        })
+        .collect()
+}
+
+/// The `help` payload. `repos` is the live bound set (one row for the
+/// single-index entry point); `tools` is the catalogue for topic=tools.
+fn help_reply(repos: Option<Vec<Value>>, args: &Value) -> Value {
+    let topic = args
+        .get("topic")
+        .and_then(Value::as_str)
+        .unwrap_or("overview")
+        .trim()
+        .to_ascii_lowercase();
+    let topic = if topic.is_empty() { "overview".to_string() } else { topic };
+    let Some(text) = help_text(&topic) else {
+        return aux_result(json!({
+            "ok": false,
+            "tool": "help",
+            "error": format!("unknown help topic {topic:?}"),
+            "topics": HELP_TOPICS,
+        }));
+    };
+    let mut body = json!({
+        "ok": true,
+        "tool": "help",
+        "topic": topic,
+        "topics": HELP_TOPICS,
+        "text": text,
+    });
+    if let Some(rows) = repos {
+        body["repos"] = json!(rows);
+    }
+    if topic == "tools" {
+        body["tools"] = json!(tool_catalogue());
+    }
+    aux_result(body)
 }
 
 /// The roots a repo's first replica reports: its configured roots, or `["."]`
@@ -1129,11 +1594,12 @@ fn workspace_body(views: &[RepoView], selected: usize, index: &Index) -> Value {
             "multiRoot": "the roots of one repo, set at spawn with repeatable `--root` (global: every bound repo uses them)",
             "reScope": "call `index {roots:[\"...\", \"...\"], repo:...}` to re-index the selected repo over different roots",
             "repoSelector": "every tool takes `repo`: a 1-based index (\"2\" or 2), a path, or a unique basename; absent = the primary repo. `index`/`index_cancel` act on the selected repo only.",
+            "bindRepo": "call `bind_repo {path, roots?, index?}` to add a repo at runtime and (by default) wait for its build; the returned `index`/`selector` selects it.",
         },
         "limitation": format!(
             "{} {} bound to one process; `--root`/`--exclude` are global and every tool selects \
              a repo with the optional `repo` argument (absent = primary). `index` rebuilds only \
-             the selected repo.",
+             the selected repo; `bind_repo` adds another at runtime.",
             n,
             if n == 1 { "repo is" } else { "repos are" }
         ),
@@ -1144,17 +1610,33 @@ fn workspace_body(views: &[RepoView], selected: usize, index: &Index) -> Value {
 /// primary), using one free slot of that repo (or all of them when the route
 /// installs a new graph). Never panics on a poisoned lock.
 fn run_tool(shared: &Shared, name: &str, args: &Value) -> Value {
+    // `bind_repo` changes the bound set; it is not a routed call and needs no
+    // selected repo (its `path` names the new one).
+    if name == "bind_repo" {
+        return bind_repo(shared, &strip_repo(args));
+    }
+    if name == "help" {
+        return help_reply(Some(repo_rows(shared)), &strip_repo(args));
+    }
     let (repo_idx, args) = match resolve_repo_argument(shared, args) {
         Ok(v) => v,
         Err(e) => return tool_error(e),
     };
-    let repo = &shared.repos[repo_idx];
+    let repo = match shared
+        .repos
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(repo_idx)
+    {
+        Some(r) => r.clone(),
+        None => return tool_error(format!("unknown repo index {}", repo_idx + 1)),
+    };
 
     // `workspace` reports the whole bound set; it is handled here so it can see
     // every repo instead of one `Index`.
     if name == "workspace" {
-        let views: Vec<RepoView> = shared
-            .repos
+        let repos = shared.repos.read().unwrap_or_else(|e| e.into_inner());
+        let views: Vec<RepoView> = repos
             .iter()
             .enumerate()
             .map(|(i, r)| {
@@ -1168,8 +1650,16 @@ fn run_tool(shared: &Shared, name: &str, args: &Value) -> Value {
                 }
             })
             .collect();
+        drop(repos);
         let index = repo.primary_index();
         return aux_result(workspace_body(&views, repo_idx, &index));
+    }
+
+    // Viewer-control tools are not routes and need no index slot: they talk to
+    // a running viewer process over its `--control` unix socket (`crate::viewer`),
+    // so a cold repo and a missing viewer must answer without ever indexing.
+    if crate::viewer::is_tool(name) {
+        return crate::viewer::invoke_tool(name, &args);
     }
 
     // MCP-only tools are not routes: take one slot of the selected repo.
@@ -1401,8 +1891,9 @@ pub fn run(opts: McpOptions) -> Result<(), String> {
     let (done_tx, done_rx) = crossbeam_channel::unbounded::<()>();
 
     let shared = Arc::new(Shared {
-        repos,
+        repos: RwLock::new(repos.into_iter().map(Arc::new).collect()),
         cfg,
+        threads,
         out: Mutex::new(io::stdout()),
     });
 
@@ -1531,6 +2022,7 @@ mod tests {
             "api_call", "state", "index", "index_cancel", "browse", "search", "node", "relation",
             "find", "refs", "source", "doc", "decls", "chain", "kinds", "definitions", "subgraph",
             "export", "projects", "viewer_state", "settings", "reorg", "preview_change",
+            "viewer_instances", "viewer_pov", "bind_repo", "help",
         ] {
             assert!(names.contains(want), "tool {want} missing from tools/list");
         }
@@ -1564,8 +2056,9 @@ mod tests {
         let listed = tools();
         assert_eq!(
             listed.len(),
-            42,
-            "22 routed tools + 14 MCP-only edit tools + 5 aux tools + 1 read-only preview tool"
+            49,
+            "the whole MCP surface: routed tools + MCP-only edit/aux tools + bind_repo/help + \
+             viewer read-only/control tools"
         );
         let names: BTreeSet<&str> = listed.iter().map(|t| t["name"].as_str().unwrap()).collect();
         for want in [
@@ -1597,6 +2090,23 @@ mod tests {
             assert!(!crate::edit::is_edit_tool(want));
             assert!(resolve_call(want, &json!({})).is_err());
         }
+
+        // `bind_repo` is a server-level MCP-only tool: no route, no edit/aux
+        // classification, and `path` is the one required argument.
+        assert!(names.contains("bind_repo"));
+        assert!(!crate::edit::is_edit_tool("bind_repo"));
+        assert!(!crate::edit::is_aux_tool("bind_repo"));
+        assert!(resolve_call("bind_repo", &json!({})).is_err());
+        let bind = listed.iter().find(|t| t["name"] == "bind_repo").unwrap();
+        assert_eq!(bind["inputSchema"]["required"], json!(["path"]));
+
+        // `help` is likewise server-level: no route, no edit/aux class.
+        assert!(names.contains("help"));
+        assert!(!crate::edit::is_edit_tool("help"));
+        assert!(!crate::edit::is_aux_tool("help"));
+        assert!(resolve_call("help", &json!({})).is_err());
+        let help = listed.iter().find(|t| t["name"] == "help").unwrap();
+        assert_eq!(help["inputSchema"]["required"], json!([]));
 
         // `copy_path` carries the full D1 argument schema, aliases named.
         let cp = listed.iter().find(|t| t["name"] == "copy_path").unwrap();
@@ -1947,7 +2457,12 @@ mod tests {
             let cancel = Arc::new(AtomicBool::new(false));
             repos.push(make_repo_slot(p.clone(), 1, cancel, &cfg, false));
         }
-        Shared { repos, cfg, out: Mutex::new(io::stdout()) }
+        Shared {
+            repos: RwLock::new(repos.into_iter().map(Arc::new).collect()),
+            cfg,
+            threads: 1,
+            out: Mutex::new(io::stdout()),
+        }
     }
 
     /// A `Shared` configured with `--root .` where the primary is pre-indexed.
@@ -1961,7 +2476,17 @@ mod tests {
             let cancel = Arc::new(AtomicBool::new(false));
             repos.push(make_repo_slot(p.clone(), 1, cancel, &cfg, i == 0));
         }
-        Shared { repos, cfg, out: Mutex::new(io::stdout()) }
+        Shared {
+            repos: RwLock::new(repos.into_iter().map(Arc::new).collect()),
+            cfg,
+            threads: 1,
+            out: Mutex::new(io::stdout()),
+        }
+    }
+
+    /// A snapshot of the bound set for selector assertions.
+    fn bound_repos(shared: &Shared) -> Vec<Arc<RepoSlot>> {
+        shared.repos.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn env_of(result: &Value) -> Value {
@@ -1971,7 +2496,11 @@ mod tests {
     #[test]
     fn every_tool_schema_carries_a_repo_property() {
         let listed = tools();
-        assert_eq!(listed.len(), 42, "tool count must stay 42");
+        assert_eq!(
+            listed.len(),
+            49,
+            "tool count must stay 49 (the full surface, incl. bind_repo/help and the viewer tools)"
+        );
         for t in &listed {
             let name = t["name"].as_str().unwrap();
             let props = &t["inputSchema"]["properties"];
@@ -2008,27 +2537,27 @@ mod tests {
             .unwrap();
         assert_eq!(call.query, json!({}));
 
-        assert_eq!(resolve_repo_selector(&shared.repos, &json!(1)).unwrap(), 0);
-        assert_eq!(resolve_repo_selector(&shared.repos, &json!(2)).unwrap(), 1);
-        assert_eq!(resolve_repo_selector(&shared.repos, &json!("2")).unwrap(), 1);
+        assert_eq!(resolve_repo_selector(&bound_repos(&shared), &json!(1)).unwrap(), 0);
+        assert_eq!(resolve_repo_selector(&bound_repos(&shared), &json!(2)).unwrap(), 1);
+        assert_eq!(resolve_repo_selector(&bound_repos(&shared), &json!("2")).unwrap(), 1);
         assert_eq!(
-            resolve_repo_selector(&shared.repos, &json!(a.to_string_lossy())).unwrap(),
+            resolve_repo_selector(&bound_repos(&shared), &json!(a.to_string_lossy())).unwrap(),
             0
         );
         assert_eq!(
-            resolve_repo_selector(&shared.repos, &json!(b.to_string_lossy())).unwrap(),
+            resolve_repo_selector(&bound_repos(&shared), &json!(b.to_string_lossy())).unwrap(),
             1
         );
         let upper = a.file_name().unwrap().to_string_lossy().to_uppercase();
-        assert_eq!(resolve_repo_selector(&shared.repos, &json!(upper)).unwrap(), 0);
+        assert_eq!(resolve_repo_selector(&bound_repos(&shared), &json!(upper)).unwrap(), 0);
 
         // Unknown index and unknown name both list every bound repo.
         for sel in [json!(3), json!(0), json!("nope")] {
-            let err = resolve_repo_selector(&shared.repos, &sel).unwrap_err();
+            let err = resolve_repo_selector(&bound_repos(&shared), &sel).unwrap_err();
             assert!(err.contains("1:") && err.contains("2:"), "{err}");
             assert!(err.contains("(default)"), "{err}");
         }
-        let err = resolve_repo_selector(&shared.repos, &json!({"x": 1})).unwrap_err();
+        let err = resolve_repo_selector(&bound_repos(&shared), &json!({"x": 1})).unwrap_err();
         assert!(err.contains("bound repos"), "{err}");
 
         let _ = fs::remove_dir_all(&a);
@@ -2044,7 +2573,7 @@ mod tests {
         fs::create_dir_all(&a).unwrap();
         fs::create_dir_all(&b).unwrap();
         let shared = test_shared(&[a.clone(), b.clone()]);
-        let err = resolve_repo_selector(&shared.repos, &json!("src")).unwrap_err();
+        let err = resolve_repo_selector(&bound_repos(&shared), &json!("src")).unwrap_err();
         assert!(err.contains("ambiguous"), "{err}");
         assert!(err.contains("1:") && err.contains("2:"), "{err}");
         let _ = fs::remove_dir_all(&root);
@@ -2060,13 +2589,13 @@ mod tests {
         )
         .unwrap();
         let shared = test_shared_hot(&[a.clone(), b.clone()]);
-        assert!(shared.repos[0].is_loaded(), "primary must be pre-indexed");
-        assert!(!shared.repos[1].is_loaded(), "secondary must start cold");
+        assert!(bound_repos(&shared)[0].is_loaded(), "primary must be pre-indexed");
+        assert!(!bound_repos(&shared)[1].is_loaded(), "secondary must start cold");
 
         let state = env_of(&run_tool(&shared, "state", &json!({"repo": 2})));
         assert_eq!(state["body"]["indexed"], true, "{state}");
         assert_eq!(state["body"]["fileCount"], 2, "{state}");
-        assert!(shared.repos[1].is_loaded(), "the first call must build repo 2");
+        assert!(bound_repos(&shared)[1].is_loaded(), "the first call must build repo 2");
 
         let _ = fs::remove_dir_all(&a);
         let _ = fs::remove_dir_all(&b);
@@ -2082,14 +2611,14 @@ mod tests {
         )
         .unwrap();
         let shared = test_shared_hot(&[a.clone(), b.clone()]);
-        assert!(shared.repos[0].is_loaded());
-        assert!(!shared.repos[1].is_loaded());
+        assert!(bound_repos(&shared)[0].is_loaded());
+        assert!(!bound_repos(&shared)[1].is_loaded());
         let repo1_before = env_of(&run_tool(&shared, "state", &json!({"repo": 1})));
 
         // `index {repo:"2"}` builds repo 2 only; repo 1 is untouched.
         let r = run_tool(&shared, "index", &json!({"repo": "2"}));
         assert_eq!(r["isError"], false, "{r}");
-        assert!(shared.repos[1].is_loaded());
+        assert!(bound_repos(&shared)[1].is_loaded());
         let repo2 = env_of(&run_tool(&shared, "state", &json!({"repo": "2"})));
         assert_eq!(repo2["body"]["fileCount"], 2, "{repo2}");
         let repo1_after = env_of(&run_tool(&shared, "state", &json!({"repo": 1})));
@@ -2100,11 +2629,11 @@ mod tests {
         assert_eq!(repo1_after["body"]["fileCount"], 1, "{repo1_after}");
 
         // `index_cancel` is out-of-band and flips only the selected repo's flag.
-        assert!(!shared.repos[0].cancel.load(Ordering::SeqCst));
+        assert!(!bound_repos(&shared)[0].cancel.load(Ordering::SeqCst));
         let c = run_tool(&shared, "index_cancel", &json!({"repo": 2}));
         assert_eq!(c["isError"], false, "{c}");
-        assert!(shared.repos[1].cancel.load(Ordering::SeqCst));
-        assert!(!shared.repos[0].cancel.load(Ordering::SeqCst));
+        assert!(bound_repos(&shared)[1].cancel.load(Ordering::SeqCst));
+        assert!(!bound_repos(&shared)[0].cancel.load(Ordering::SeqCst));
 
         let _ = fs::remove_dir_all(&a);
         let _ = fs::remove_dir_all(&b);
@@ -2172,12 +2701,120 @@ mod tests {
         // No global `--root`: a secondary still builds, like an explicit
         // `index`, using `Config::default()`'s roots.
         let shared = test_shared(&[a.clone(), b.clone()]);
-        assert!(!shared.repos[1].is_loaded());
+        assert!(!bound_repos(&shared)[1].is_loaded());
         let s = env_of(&run_tool(&shared, "state", &json!({"repo": 2})));
         assert_eq!(s["body"]["indexed"], true, "{s}");
         assert_eq!(s["body"]["fileCount"], 1, "{s}");
         assert_eq!(s["body"]["roots"], json!(["_sealed_src"]), "{s}");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bind_repo_adds_and_indexes_a_repository_synchronously() {
+        let root = std::env::temp_dir().join(format!("csgraph-mcp-bind-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let a = root.join("a");
+        let b = root.join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(b.join("Packages/com.example")).unwrap();
+        fs::write(
+            b.join("Packages/com.example/X.cs"),
+            "namespace X {\n public class C {\n  public int M() { return 1; }\n }\n}\n",
+        )
+        .unwrap();
+        let shared = test_shared(&[a.clone()]);
+
+        // Bind + index and wait: the reply already reports the built graph.
+        let r = run_tool(
+            &shared,
+            "bind_repo",
+            &json!({"path": b.to_string_lossy(), "roots": ["Packages"]}),
+        );
+        assert_eq!(r["isError"], false, "{r}");
+        let env = env_of(&r);
+        assert_eq!(env["index"], 2, "{env}");
+        assert_eq!(env["reused"], false, "{env}");
+        assert_eq!(env["indexed"], true, "{env}");
+        assert_eq!(env["files"], 1, "{env}");
+        assert_eq!(env["selector"], "2", "{env}");
+
+        // Immediately readable through the returned selector.
+        let state = env_of(&run_tool(&shared, "state", &json!({"repo": env["selector"]})));
+        assert_eq!(state["body"]["indexed"], true, "{state}");
+        assert_eq!(state["body"]["fileCount"], 1, "{state}");
+
+        // Idempotent: the same canonical path reuses the binding.
+        let again = env_of(&run_tool(
+            &shared,
+            "bind_repo",
+            &json!({"path": b.join(".").to_string_lossy()}),
+        ));
+        assert_eq!(again["reused"], true, "{again}");
+        assert_eq!(again["index"], 2, "{again}");
+        assert_eq!(again["files"], 1, "{again}");
+
+        // `workspace` now lists both repos.
+        let ws = env_of(&run_tool(&shared, "workspace", &json!({})));
+        assert_eq!(ws["repos"].as_array().unwrap().len(), 2, "{ws}");
+
+        // A missing path is an honest tool error, not a silent bind.
+        let bad = run_tool(
+            &shared,
+            "bind_repo",
+            &json!({"path": root.join("nope").to_string_lossy()}),
+        );
+        assert_eq!(bad["isError"], true, "{bad}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn help_returns_topic_text_topics_and_live_repos() {
+        let a = fixture("help-a");
+        let shared = test_shared(&[a.clone()]);
+
+        let env = env_of(&run_tool(&shared, "help", &json!({})));
+        assert_eq!(env["ok"], true, "{env}");
+        assert_eq!(env["topic"], "overview", "{env}");
+        assert!(env["text"].as_str().unwrap().contains("bind_repo"), "{env}");
+        assert!(
+            env["topics"].as_array().unwrap().contains(&json!("index")),
+            "{env}"
+        );
+        let repos = env["repos"].as_array().unwrap();
+        assert_eq!(repos.len(), 1, "{env}");
+        assert_eq!(repos[0]["index"], 1, "{env}");
+        assert_eq!(repos[0]["default"], true, "{env}");
+
+        let index_help = env_of(&run_tool(&shared, "help", &json!({"topic": "index"})));
+        let text = index_help["text"].as_str().unwrap();
+        assert!(text.contains("bind_repo"), "{index_help}");
+        assert!(text.contains("index_cancel"), "{index_help}");
+        assert!(text.contains("timeout"), "{index_help}");
+
+        let catalogue = env_of(&run_tool(&shared, "help", &json!({"topic": "tools"})));
+        let tools = catalogue["tools"].as_array().unwrap();
+        assert!(tools.len() >= 40, "{catalogue}");
+        assert!(tools.iter().any(|t| t["name"] == "bind_repo"), "{catalogue}");
+        assert!(tools.iter().any(|t| t["name"] == "help"), "{catalogue}");
+
+        let bad = run_tool(&shared, "help", &json!({"topic": "nope"}));
+        assert_eq!(bad["isError"], true, "{bad}");
+        let bad_env = env_of(&bad);
+        assert!(
+            bad_env["error"].as_str().unwrap().contains("unknown help topic"),
+            "{bad_env}"
+        );
+        assert!(bad_env["topics"].as_array().unwrap().len() >= 7, "{bad_env}");
+
+        // The single-index entry point still answers help with one repo row.
+        let (dir, mut ix) = indexed("help-single");
+        let single = env_of(&invoke_on_index(&mut ix, "help", &json!({"topic": "repos"})));
+        assert_eq!(single["repos"].as_array().unwrap().len(), 1, "{single}");
+        assert_eq!(single["repos"][0]["index"], 1, "{single}");
+
+        let _ = fs::remove_dir_all(&a);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

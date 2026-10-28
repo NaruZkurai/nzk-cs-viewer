@@ -69,11 +69,21 @@ impl Default for Config {
 pub struct Settings {
     #[serde(rename = "uiTheme")]
     pub ui_theme: String,
+    /// Publish this viewer into the cross-user instance registry so a csgraph
+    /// MCP server running as another user can auto-detect it. Default **on**
+    /// (`true`), as the owner asked ("same as last image boot default on");
+    /// `false` makes this viewer invisible to discovery.
+    #[serde(rename = "viewerDiscovery", default = "default_viewer_discovery")]
+    pub viewer_discovery: bool,
+}
+
+fn default_viewer_discovery() -> bool {
+    true
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { ui_theme: "nzk-dark+".to_string() }
+        Settings { ui_theme: "nzk-dark+".to_string(), viewer_discovery: true }
     }
 }
 
@@ -118,6 +128,9 @@ pub fn load_settings(path: Option<&Path>) -> Settings {
                 if let Some(Value::String(t)) = map.get("uiTheme") {
                     out.ui_theme = t.clone();
                 }
+                if let Some(Value::Bool(b)) = map.get("viewerDiscovery") {
+                    out.viewer_discovery = *b;
+                }
             }
             Ok(_) => {}
             Err(e) => eprintln!("[csgraph] settings {} unreadable ({}); using defaults",
@@ -142,6 +155,9 @@ pub fn save_settings(patch: &Value, path: Option<&Path>) -> Option<Settings> {
             if UI_THEMES.contains(&t.as_str()) {
                 cfg.ui_theme = t.clone();       // never let a bad value clobber a good one
             }
+        }
+        if let Some(Value::Bool(b)) = map.get("viewerDiscovery") {
+            cfg.viewer_discovery = *b;
         }
     }
     if !UI_THEMES.contains(&cfg.ui_theme.as_str()) {
@@ -664,7 +680,18 @@ pub fn discover_projects(repo: &Path, roots: &[String], levels: usize) -> Projec
         }
     }
 
+    // The scope is known before any project is built: a `.csproj` outside the
+    // indexed repo/roots is dropped from the model at the end anyway, so reading
+    // it (and, for an SDK-style project, walking its whole directory for the
+    // default `**/*.cs` glob) is pure waste. On the real Unity layout the repo
+    // sits under `<unity>/Assets/<pkg>` and the parent holds every
+    // Unity-generated `.csproj`; building those cost seconds of `stat`/`read`
+    // work that the next step then threw away.
+    let scopes = project_scope_dirs(repo, roots);
+
+    let debug_timing = std::env::var_os("CSGRAPH_BUILD_TIMING").is_some();
     for (dir, deep) in scans {
+        let t_scan = std::time::Instant::now();
         let mut paths: Vec<PathBuf> = Vec::new();
         for entry in WalkDir::new(&dir)
             .follow_links(false)
@@ -679,24 +706,88 @@ pub fn discover_projects(repo: &Path, roots: &[String], levels: usize) -> Projec
             }
         }
         paths.sort();
+        let n_paths = paths.len();
         for path in paths {
-            scan_project_file(&path, repo, &mut model, &mut projects, &mut seen);
+            scan_project_file(&path, repo, &scopes, &mut model, &mut projects, &mut seen);
+        }
+        if debug_timing {
+            eprintln!(
+                "[timing]   projects.scan deep={deep} dir={} files={n_paths} {}ms",
+                dir.display(),
+                t_scan.elapsed().as_millis()
+            );
         }
     }
 
     projects.sort_by(|a, b| a.path.cmp(&b.path));
     projects.dedup_by(|a, b| a.path == b.path);
+
+    // Keep the final filter even though scope is applied before building: it is
+    // the authoritative guard that no caller (or a `.sln`-referenced file) can
+    // leak a foreign project into `/api/projects` or the viewer's Filters list.
+    projects.retain(|p| project_path_in_scope(repo, &p.path, &scopes));
+    for p in &mut projects {
+        p.files.retain(|f| project_path_in_scope(repo, f, &scopes));
+    }
+
     model.projects = projects;
+    model.solutions.retain(|s| project_path_in_scope(repo, s, &scopes));
     model.solutions.sort();
     model.diagnostics.sort();
     model.diagnostics.dedup();
     model
 }
 
+/// Absolute directories a discovered project is allowed to live under: the
+/// indexed repo itself plus every configured root (relative roots join the
+/// repo). Canonicalised so a symlinked repo path (`~/nem` -> `/run/media/...`)
+/// and the canonical paths a `.sln`/`.csproj` reports compare equal.
+fn project_scope_dirs(repo: &Path, roots: &[String]) -> Vec<PathBuf> {
+    let mut out = vec![fs::canonicalize(repo).unwrap_or_else(|_| absolutise(repo))];
+    for r in roots {
+        if r.is_empty() {
+            continue;
+        }
+        let p = if Path::new(r).is_absolute() {
+            PathBuf::from(r)
+        } else {
+            repo.join(r)
+        };
+        let p = fs::canonicalize(&p).unwrap_or_else(|_| absolutise(&p));
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// `true` when the repo-relative (or absolute) display path `path` resolves
+/// inside one of `scopes`. Unresolvable paths are out of scope: an external,
+/// missing or stale project must not be advertised as part of this corpus.
+fn project_path_in_scope(repo: &Path, path: &str, scopes: &[PathBuf]) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let p = Path::new(path);
+    let p = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        repo.join(p)
+    };
+    let p = fs::canonicalize(&p).unwrap_or_else(|_| absolutise(&p));
+    scopes.iter().any(|scope| p.starts_with(scope))
+}
+
 /// Read a `.sln` or `.csproj` into the model (or record why it could not).
+///
+/// `scopes` is the corpus this model is for: a `.csproj` outside it is never
+/// read or expanded. Its only possible fate later is being dropped, so building
+/// it first (and walking a Unity project root for an SDK-style glob, or stat-ing
+/// thousands of explicit `<Compile Include>` entries) is work no answer can use.
 fn scan_project_file(
     path: &Path,
     repo: &Path,
+    scopes: &[PathBuf],
     model: &mut ProjectModel,
     projects: &mut Vec<Project>,
     seen: &mut HashSet<PathBuf>,
@@ -719,6 +810,9 @@ fn scan_project_file(
                     let child_rel = crate::parser::display_path(&child, repo);
                     match fs::canonicalize(&child) {
                         Ok(c) => {
+                            if !scopes.iter().any(|scope| c.starts_with(scope)) {
+                                continue;
+                            }
                             if seen.insert(c.clone()) {
                                 match read_csproj(&c) {
                                     Ok(fields) => projects.push(build_project(
@@ -743,6 +837,9 @@ fn scan_project_file(
         }
     } else if file_name.ends_with(".csproj") {
         if let Ok(c) = fs::canonicalize(path) {
+            if !scopes.iter().any(|scope| c.starts_with(scope)) {
+                return;
+            }
             if seen.insert(c.clone()) {
                 match read_csproj(&c) {
                     Ok(fields) => {
@@ -1109,5 +1206,60 @@ mod tests {
         assert_eq!(p.name, "Widget");
         assert_eq!(p.files, vec!["Widget/Widget.cs".to_string()]);
         let _ = fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    /// A project outside the indexed repo/roots is NOT part of this corpus.
+    ///
+    /// The real shape: the indexed folder is a Unity package under
+    /// `<unity>/Assets/<pkg>`, and `<unity>/` (the repo's parent) holds a pile
+    /// of Unity-generated `.csproj` files. Discovery probes the parent by
+    /// design, but the model must not advertise those foreign projects in
+    /// `/api/projects` or the viewer's Filters list.
+    #[test]
+    fn projects_outside_the_indexed_scope_are_dropped() {
+        let repo = proj_repo("scope");
+        let parent = repo.parent().unwrap().to_path_buf();
+        // Inside the corpus.
+        write(&repo.join("Inside/Inside.csproj"), &sdk_csproj("Inside", "TRACE"));
+        write(&repo.join("Inside/Inside.cs"), "namespace N { class Inside {} }\n");
+        // Same discovery scan, but outside the indexed folder.
+        write(&parent.join("Outside.csproj"), &sdk_csproj("Outside", "TRACE"));
+        write(&parent.join("Outside.cs"), "namespace N { class Outside {} }\n");
+
+        let m = discover_projects(&repo, &[], 3);
+        let names: Vec<&str> = m.projects.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"Inside"), "in-scope project must stay: {names:?}");
+        assert!(
+            !names.contains(&"Outside"),
+            "a parent-directory project leaked into the indexed corpus: {names:?}"
+        );
+
+        // A configured root is also in scope.
+        let m = discover_projects(&parent, &[repo.to_string_lossy().into_owned()], 3);
+        assert!(
+            m.projects.iter().any(|p| p.name == "Inside"),
+            "a project under an explicit root must stay: {:?}",
+            m.projects.iter().map(|p| &p.name).collect::<Vec<_>>()
+        );
+
+        // Explicit `<Compile Include>` entries outside the scope are dropped
+        // from the project's file list too, so `?files=1` cannot advertise a
+        // file the index never parsed.
+        write(
+            &repo.join("Inside/Inside.csproj"),
+            "<Project ToolsVersion=\"4.0\">\n\
+             <PropertyGroup><AssemblyName>Inside</AssemblyName></PropertyGroup>\n\
+             <ItemGroup><Compile Include=\"..\\..\\Outside.cs\" /></ItemGroup>\n\
+             </Project>\n",
+        );
+        let m = discover_projects(&repo, &[], 3);
+        let inside = m.projects.iter().find(|p| p.name == "Inside").unwrap();
+        assert!(
+            !inside.files.iter().any(|f| f.ends_with("Outside.cs")),
+            "out-of-scope source file leaked into the project: {:?}",
+            inside.files
+        );
+
+        let _ = fs::remove_dir_all(parent);
     }
 }

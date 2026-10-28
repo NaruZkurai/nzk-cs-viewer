@@ -1,0 +1,12 @@
+.cs-problems-note { padding: 0 0 7px; color: var(--text-faint, #6b7897);
+  font-family: var(--mono, monospace); font-size: 9.5px; line-height: 1.45; }
+.cs-problem { display: flex; align-items: baseline; gap: 6px; padding: 4px 8px;
+  border-bottom: 1px solid var(--border-soft, #232c42);
+  font-family: var(--mono, monospace); font-size: 10.5px; line-height: 1.4; }
+.cs-problem:last-child { border-bottom: 0; }
+.cs-problem-loc { flex: none; padding: 0; border: 0; background: transparent;
+  color: var(--vt-info, #42c3d0); font: inherit; cursor: pointer; text-align: left; }
+.cs-problem-loc:hover { text-decoration: underline; }
+.cs-problem-text { flex: 1 1 auto; min-width: 0; color: var(--text-dim, #9aa6c2);
+  word-break: break-word; }
+.cs-problem-count-tag { color: var(--warn, #ffed2e); }

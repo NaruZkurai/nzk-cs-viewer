@@ -24,7 +24,9 @@ pub mod cache;
 pub mod doc;
 pub mod reorg;
 pub mod config;
+pub mod guard;
 pub mod index;
+pub mod registry;
 pub mod api;
 pub mod mcp;
 pub mod edit;
@@ -32,6 +34,7 @@ pub mod compile_check;
 pub mod dedupe;
 pub mod reshape;
 pub mod preview;
+pub mod viewer;
 
 /// The engine version, reported by `/api/state` and the CLI.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

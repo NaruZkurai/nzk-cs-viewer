@@ -43,7 +43,7 @@ use crate::doc::{self, DocCache};
 use crate::graph::build_graph;
 use crate::lex::{active_line_flags, mask_noncode, strip_bom};
 use crate::model::to_chars;
-use crate::parser::{discover_files, display_path, parse_source};
+use crate::parser::{discover_files, display_path};
 
 /// The Python cache db name; kept only so it can be excluded from discovery
 /// (the v2 cache is a directory, [`CACHE_DIR`]).
@@ -205,6 +205,11 @@ pub const DECLS_LIMIT: usize = 5000;
 /// How many synthesized documents an index memoizes before evicting the oldest.
 /// Each one can be megabytes, so this is a memory ceiling, not just a cache size.
 pub const DOC_CACHE_MAX: usize = 16;
+
+/// Files per parallel parse chunk in [`Index::parse_files`]. Small enough that a
+/// Stop request is honoured within a chunk, large enough that the scoped worker
+/// pool is not rebuilt per file.
+const PARSE_CHUNK: usize = 64;
 
 /// True when a node is an unresolved stub — a symbol referenced but never
 /// declared inside the indexed roots.
@@ -500,6 +505,47 @@ pub struct Index {
     /// Checked with a relaxed load inside the parse/read loops: an O(1) flag
     /// test, never a scan of the graph.
     cancel: Arc<AtomicBool>,
+}
+
+/// Pick one live viewer instance for a selector, or refuse with candidates.
+///
+/// Returns `(active, ambiguous, selectedBy, note)`. Exactly one live instance
+/// auto-selects; zero is empty; several are ambiguous and `active` is `None`.
+fn select_instance<'a>(
+    live: &[&'a crate::registry::Instance],
+    selector: Option<&str>,
+) -> (Option<&'a crate::registry::Instance>, bool, &'static str, &'static str) {
+    match selector {
+        Some(sel) if !sel.trim().is_empty() => {
+            let matched: Vec<&&'a crate::registry::Instance> =
+                live.iter().filter(|i| i.matches(sel)).collect();
+            match matched.len() {
+                1 => (Some(*matched[0]), false, "instance", ""),
+                0 => (
+                    None,
+                    false,
+                    "instance",
+                    "no live viewer instance matches the selector",
+                ),
+                _ => (
+                    None,
+                    true,
+                    "instance",
+                    "the selector matches several live viewers; refine it to one pid",
+                ),
+            }
+        }
+        _ => match live.len() {
+            1 => (Some(live[0]), false, "auto", ""),
+            0 => (None, false, "auto", "no live viewer instance was found"),
+            _ => (
+                None,
+                true,
+                "auto",
+                "several live viewers are running; pass instance=<pid|repo|root> to pick one",
+            ),
+        },
+    }
 }
 
 impl Index {
@@ -1051,7 +1097,12 @@ impl Index {
         if self.cancelled() {
             return self.finish_cancelled(snapshot);
         }
+        let t_graph = Instant::now();
         let gb = build_graph(&parse);
+        if timing {
+            eprintln!("[timing] graph {}ms", t_graph.elapsed().as_millis());
+        }
+        let t_mat = Instant::now();
         if self.cancelled() {
             return self.finish_cancelled(snapshot);
         }
@@ -1214,6 +1265,14 @@ impl Index {
             rs.sort_by(|a, b| (a.0, -(a.1 - a.0)).cmp(&(b.0, -(b.1 - b.0))));
         }
 
+        if timing {
+            eprintln!(
+                "[timing] materialize {}ms nodes={} edges={}",
+                t_mat.elapsed().as_millis(),
+                nodes.len(),
+                edges.len()
+            );
+        }
         let payload = GraphPayload {
             nodes,
             edges,
@@ -1223,30 +1282,60 @@ impl Index {
             warnings: warnings.iter().take(200).cloned().collect(),
             file_count: files.len(),
         };
+        if timing {
+            eprintln!("[timing] payload {}ms", t_mat.elapsed().as_millis());
+        }
+        let t_store = Instant::now();
         self.store_graph_cache(&cache, &sig, &payload);
         self.from_cache = false;
         self.install(payload, roots, parse_ms, false);
-        self.state()
+        if timing {
+            eprintln!("[timing] install {}ms", t_store.elapsed().as_millis());
+        }
+        let t_state = Instant::now();
+        let state = self.state();
+        if timing {
+            eprintln!("[timing] state {}ms", t_state.elapsed().as_millis());
+        }
+        state
     }
 
     /// `_parse_files(db, files)` — reuse unchanged files, parse the rest.
     ///
     /// `None` means the Stop flag was seen between files: the caller abandons
     /// the build without installing anything.
+    /// Parse every discovered file, in three phases so the expensive part is
+    /// parallel without changing any observable output:
+    ///
+    /// 1. **serial plan** — stat + cache lookup per file (the `Cache` is not
+    ///    `Sync`, and its writes are the only shared mutable state), with the
+    ///    per-file `cancelled()` check exactly where the serial loop had it;
+    /// 2. **parallel parse** — misses are parsed by
+    ///    [`crate::parser::parse_files_parallel`] in bounded chunks, so a Stop
+    ///    request is still honoured between chunks;
+    /// 3. **serial merge** — cache writes, project-attributed warnings and the
+    ///    output vector are rebuilt in original file order, so the payload is
+    ///    identical to the serial loop's.
     fn parse_files(&mut self, cache: &Cache, files: &[String]) -> Option<(Vec<Value>, Vec<String>)> {
-        let mut parse: Vec<Value> = Vec::new();
-        let mut warnings: Vec<String> = Vec::new();
         self.cache_hits = 0;
         self.cache_misses = 0;
+        let defines = self.defines.clone();
+        let repo = self.repo.clone();
+
+        enum Slot {
+            Hit(Value),
+            Miss { key: String, size: u64, mtime: f64 },
+            Skipped,
+        }
+
+        // ---- phase 1: serial plan (the Cache is not Sync) ------------------
+        let mut slots: Vec<Slot> = Vec::with_capacity(files.len());
         for f in files {
-            // The per-file loop is where most of a big corpus' wall time goes;
-            // parity of parse cost per iteration means a per-file check stops
-            // the build within roughly one file, not one corpus.
             if self.cancelled() {
                 return None;
             }
             let Ok(st) = fs::metadata(f) else {
-                warnings.push(format!("{f}: stat failed"));
+                slots.push(Slot::Skipped);
                 continue;
             };
             let size = st.len();
@@ -1256,30 +1345,65 @@ impl Index {
                 normpath(Path::new(f)).to_string_lossy(),
                 self.defines_sig
             );
-            let mut pr: Option<Value> = None;
+            let mut hit: Option<Value> = None;
             if let Some(blob) = cache.get("parse", &key) {
                 if let Ok(ent) = serde_json::from_slice::<ParseEntry>(&blob) {
                     if ent.size == size && (ent.mtime - mtime).abs() < 1e-6 {
-                        pr = Some(ent.parse);
+                        hit = Some(ent.parse);
                         self.cache_hits += 1;
                     }
                 }
             }
-            if pr.is_none() {
-                let display = self.display(Path::new(f));
-                let p = parse_source(Path::new(f), &display, self.defines.as_ref());
-                self.cache_misses += 1;
-                let ent = ParseEntry {
-                    size,
-                    mtime,
-                    parse: p.clone(),
-                };
-                if let Ok(bytes) = serde_json::to_vec(&ent) {
-                    let _ = cache.put("parse", &key, &bytes);
-                }
-                pr = Some(p);
+            slots.push(match hit {
+                Some(pr) => Slot::Hit(pr),
+                None => Slot::Miss { key, size, mtime },
+            });
+        }
+
+        // ---- phase 2: parallel parse of the misses -------------------------
+        let mut parsed: Vec<Option<Value>> = vec![None; files.len()];
+        for (i, s) in slots.iter().enumerate() {
+            if let Slot::Hit(pr) = s {
+                parsed[i] = Some(pr.clone());
             }
-            let pr = pr.unwrap();
+        }
+        let miss_ix: Vec<usize> = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| matches!(s, Slot::Miss { .. }).then_some(i))
+            .collect();
+        let cancel = self.cancel.clone();
+        let mut parsed_misses: Vec<(usize, Value)> = Vec::with_capacity(miss_ix.len());
+        for chunk in miss_ix.chunks(PARSE_CHUNK) {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            let chunk_files: Vec<String> = chunk.iter().map(|&i| files[i].clone()).collect();
+            let out = crate::parser::parse_files_parallel(&chunk_files, &repo, defines.as_ref());
+            for (&i, pr) in chunk.iter().zip(out.into_iter()) {
+                parsed_misses.push((i, pr));
+            }
+            self.cache_misses += chunk.len();
+        }
+
+        // ---- phase 3: serial merge, original order -------------------------
+        for (i, pr) in parsed_misses {
+            if let Slot::Miss { key, size, mtime } = &slots[i] {
+                let ent = ParseEntry { size: *size, mtime: *mtime, parse: pr.clone() };
+                if let Ok(bytes) = serde_json::to_vec(&ent) {
+                    let _ = cache.put("parse", key, &bytes);
+                }
+            }
+            parsed[i] = Some(pr);
+        }
+        let mut parse: Vec<Value> = Vec::with_capacity(files.len());
+        let mut warnings: Vec<String> = Vec::new();
+        for (i, f) in files.iter().enumerate() {
+            let Some(pr) = parsed[i].take() else {
+                // `stat` failed: the serial loop warned instead of parsing.
+                warnings.push(format!("{f}: stat failed"));
+                continue;
+            };
             let display = self.display(Path::new(f));
             if let Some(ws) = pr.get("warnings").and_then(|v| v.as_array()) {
                 for w in ws {
@@ -1457,6 +1581,173 @@ impl Index {
     pub fn save_viewer_state(&mut self, obj: &Value) -> bool {
         let cache = self.current_cache();
         cache.save_viewer_state(obj).is_ok()
+    }
+
+    // -- live viewer POV (selection + focus) --------------------------------
+
+    /// Candidate `viewer.json` paths this engine can read itself: every
+    /// configured/current root's cache dir plus the repo. Used when instance
+    /// discovery yields no state path (an argument-less GUI launch) and to read
+    /// a stale snapshot honestly when no viewer is running.
+    fn viewer_state_paths(&self) -> Vec<PathBuf> {
+        let mut roots: Vec<String> = Vec::new();
+        roots.extend(self.roots.iter().cloned());
+        roots.extend(self.cfg.roots.iter().cloned());
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for r in &roots {
+            let d = self.cache_dir(Some(std::slice::from_ref(r)));
+            if !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+        let d = self.cache_dir(None);
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+        if !dirs.contains(&self.repo) {
+            dirs.push(self.repo.clone());
+        }
+        dirs.iter().map(|d| crate::registry::state_path_for(d)).collect()
+    }
+
+    /// `GET /api/viewer_instances` — enumerate every discovered cs viewer
+    /// instance (live *and* stale, each labelled) and auto-select one.
+    ///
+    /// Auto-selection is deliberately conservative: exactly one live instance
+    /// selects itself; zero live instances is an honest empty result; several
+    /// live instances are reported as `ambiguous` with the candidate list and
+    /// `active: null`, never a guess.
+    pub fn viewer_instances(&self, selector: Option<&str>) -> Value {
+        let (instances, discovery) = crate::registry::discover(&self.repo_str);
+        let live: Vec<&crate::registry::Instance> =
+            instances.iter().filter(|i| i.alive).collect();
+        let (active, ambiguous, matched_by, note) = select_instance(&live, selector);
+        json!({
+            "ok": true,
+            "repo": self.repo_str,
+            "discovery": discovery,
+            "instances": instances.iter().map(|i| i.to_json()).collect::<Vec<_>>(),
+            "liveCount": live.len(),
+            "active": active.map(|i| i.to_json()),
+            "ambiguous": ambiguous,
+            "selectedBy": matched_by,
+            "staleAfterMs": crate::registry::STALE_AFTER_MS,
+            "note": note,
+        })
+    }
+
+    /// `GET /api/viewer_pov` — the running viewer's POV: Monaco text selection,
+    /// graph box (marquee) selection, and the loose IDE context, plus honest
+    /// freshness metadata.
+    ///
+    /// Cross-process: the viewer publishes `pov` inside its `viewer.json`
+    /// ([`Index::save_viewer_state`]); this reads the file of the selected
+    /// instance (or, when there is no live instance, the freshest candidate file
+    /// in this engine's own scope) and never fabricates a field.
+    pub fn viewer_pov(&self, selector: Option<&str>) -> Value {
+        let now = crate::registry::now_ms();
+        let (instances, discovery) = crate::registry::discover(&self.repo_str);
+        let live: Vec<&crate::registry::Instance> =
+            instances.iter().filter(|i| i.alive).collect();
+        let (active, ambiguous, matched_by, note) = select_instance(&live, selector);
+
+        // An ambiguous/empty selection must not silently read somebody else's
+        // file: when a selector was given or auto-selection is ambiguous, stop
+        // with `pov: null` and the candidates.
+        let refused = ambiguous || (selector.map(|s| !s.trim().is_empty()).unwrap_or(false) && active.is_none());
+
+        let mut chosen: Option<(String, Value, i64, Option<bool>, &'static str)> = None;
+        if !refused {
+            if let Some(inst) = active {
+                if !inst.state_path.is_empty() {
+                    if let Some((v, m)) =
+                        crate::registry::read_state_file(Path::new(&inst.state_path))
+                    {
+                        chosen = Some((inst.state_path.clone(), v, m, Some(true), "instance"));
+                    }
+                }
+            }
+            if chosen.is_none() {
+                // No live instance at all: a stale local snapshot is still
+                // useful, and is labelled stale below. If a live instance exists
+                // but knows no state path, the same local read is the only
+                // honest option (publisherAlive stays unknown).
+                let publisher_alive = if live.is_empty() { Some(false) } else { None };
+                let mut best: Option<(String, Value, i64)> = None;
+                for p in self.viewer_state_paths() {
+                    if let Some((v, m)) = crate::registry::read_state_file(&p) {
+                        if best.as_ref().map(|(_, _, bm)| m > *bm).unwrap_or(true) {
+                            best = Some((p.to_string_lossy().into_owned(), v, m));
+                        }
+                    }
+                }
+                if let Some((p, v, m)) = best {
+                    chosen = Some((p, v, m, publisher_alive, "local"));
+                }
+            }
+        }
+
+        let (state_path, pov, tabs, selected, at, mtime, live_flag, stale, publisher_alive, source) =
+            match chosen {
+                Some((path, value, mtime, publisher_alive, source)) => {
+                    let pov = value.get("pov").cloned().filter(|v| !v.is_null());
+                    let tabs = value.get("tabs").cloned().filter(|v| !v.is_null());
+                    let selected = value.get("selected").cloned().filter(|v| !v.is_null());
+                    let at = pov
+                        .as_ref()
+                        .and_then(|p| p.get("at"))
+                        .and_then(Value::as_i64);
+                    let age = at.map(|t| (now - t).max(0)).unwrap_or_else(|| (now - mtime).max(0));
+                    let is_live = age <= crate::registry::STALE_AFTER_MS;
+                    (
+                        Some(path),
+                        pov,
+                        tabs,
+                        selected,
+                        at,
+                        Some(mtime),
+                        is_live,
+                        !is_live,
+                        publisher_alive,
+                        Some(source),
+                    )
+                }
+                None => (None, None, None, None, None, None, false, true, None, None),
+            };
+
+        let note = if refused {
+            note
+        } else if pov.is_none() {
+            "no published POV in the viewer state file (the viewer may predate this feature, or nothing is selected yet)"
+        } else {
+            note
+        };
+
+        json!({
+            "ok": true,
+            "repo": self.repo_str,
+            "discovery": discovery,
+            "instances": instances.iter().map(|i| i.to_json()).collect::<Vec<_>>(),
+            "liveCount": live.len(),
+            "active": active.map(|i| i.to_json()),
+            "ambiguous": ambiguous,
+            "selectedBy": matched_by,
+            "statePath": state_path,
+            "source": source,
+            "mtimeMs": mtime,
+            "at": at,
+            "ageMs": at
+                .map(|t| (now - t).max(0))
+                .or_else(|| mtime.map(|m| (now - m).max(0))),
+            "staleAfterMs": crate::registry::STALE_AFTER_MS,
+            "live": live_flag,
+            "stale": stale,
+            "publisherAlive": publisher_alive,
+            "pov": pov,
+            "tabs": tabs,
+            "selected": selected,
+            "note": note,
+        })
     }
 
     // -- reads --------------------------------------------------------------
@@ -4465,6 +4756,60 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The auto-selection rule for live viewer instances: one selects itself,
+    /// zero is empty, several are ambiguous (never a guess).
+    #[test]
+    fn instance_selection_is_conservative_when_ambiguous() {
+        fn inst(pid: u32, user: &str) -> crate::registry::Instance {
+            crate::registry::Instance {
+                pid,
+                uid: Some(0),
+                user: user.to_string(),
+                repo: "/repo".to_string(),
+                roots: vec!["r".to_string()],
+                cache_dir: "/repo/r".to_string(),
+                state_path: "/repo/r/.csgraph.v2/viewer.json".to_string(),
+                mode: "serve".to_string(),
+                port: None,
+                started_ms: 0,
+                alive: true,
+                stale: false,
+                cmdline: String::new(),
+                record: String::new(),
+                source: "registry",
+            }
+        }
+        let a = inst(1, "alice");
+        let b = inst(2, "bob");
+
+        let one = vec![&a];
+        let (active, ambiguous, by, _) = select_instance(&one, None);
+        assert_eq!(active.map(|i| i.pid), Some(1));
+        assert!(!ambiguous);
+        assert_eq!(by, "auto");
+
+        let none: Vec<&crate::registry::Instance> = Vec::new();
+        let (active, ambiguous, _, note) = select_instance(&none, None);
+        assert!(active.is_none());
+        assert!(!ambiguous);
+        assert!(note.contains("no live viewer"));
+
+        let two = vec![&a, &b];
+        let (active, ambiguous, _, note) = select_instance(&two, None);
+        assert!(active.is_none());
+        assert!(ambiguous);
+        assert!(note.contains("instance="));
+
+        let (active, ambiguous, by, _) = select_instance(&two, Some("bob"));
+        assert_eq!(active.map(|i| i.pid), Some(2));
+        assert!(!ambiguous);
+        assert_eq!(by, "instance");
+
+        let (active, ambiguous, _, _) = select_instance(&two, Some("nobody"));
+        assert!(active.is_none());
+        assert!(!ambiguous);
     }
 }
 

@@ -32,10 +32,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Value};
 
 use crate::edit::{
-    bget, block_comment_starts, canonical_file, code_tokens, commit_move_files, decl_slices,
-    declared_names, disk_text, infer_class_from_path, move_target_path, parse_gate_candidates,
-    qualify_map, resolve_declaration, resolve_from_declaration, resolve_move_target, sget, str_of,
-    transform_line, write_atomic_sync, MoveFile, DECL_KEYWORDS, TYPE_KINDS,
+    allow_outside_root, bget, block_comment_starts, canonical_file, code_tokens, commit_move_files,
+    decl_slices, declared_names, disk_text, infer_class_from_path, move_target_path,
+    parse_gate_candidates, qualify_map, resolve_declaration, resolve_from_declaration,
+    resolve_move_target, sget, str_of, transform_line, write_atomic_sync, MoveFile, DECL_KEYWORDS,
+    TYPE_KINDS,
 };
 use crate::index::Index;
 
@@ -1133,6 +1134,7 @@ fn apply_candidates(
     allow_invalid: bool,
     require_validated: bool,
     toolchain: Option<&str>,
+    allow_outside_root: bool,
 ) -> ApplyResult {
     let mut r = ApplyResult {
         validated: "not-run".to_string(),
@@ -1193,7 +1195,7 @@ fn apply_candidates(
     }
     let mut writes: Vec<MoveFile> = Vec::new();
     for (display, content, _existed) in candidates {
-        let (abs, ddisp, dexisted) = match resolve_move_target(index, display) {
+        let (abs, ddisp, dexisted) = match resolve_move_target(index, display, allow_outside_root) {
             Ok(x) => x,
             Err(e) => {
                 r.error = Some(json!({"ok": false, "error": e}));
@@ -1437,6 +1439,7 @@ pub fn reformat(index: &Index, args: &Value) -> Value {
         allow_invalid,
         require_validated,
         sget(args, "_dotnet"),
+        allow_outside_root(args),
     );
     if let Some(e) = outcome.error {
         return e;
@@ -2135,7 +2138,8 @@ pub fn functionize(index: &Index, args: &Value) -> Value {
         candidates.push((file.clone(), out.join("\n"), true));
     }
 
-    let (dest_abs, dest_display, dest_existed) = match resolve_move_target(index, &raw_dest) {
+    let (dest_abs, dest_display, dest_existed) =
+        match resolve_move_target(index, &raw_dest, allow_outside_root(args)) {
         Ok(x) => x,
         Err(e) => return json!({"ok": false, "error": e}),
     };
@@ -2167,6 +2171,7 @@ pub fn functionize(index: &Index, args: &Value) -> Value {
         allow_invalid,
         require_validated,
         sget(args, "_dotnet"),
+        allow_outside_root(args),
     );
     if let Some(e) = outcome.error {
         return e;

@@ -1,0 +1,492 @@
+/* css-shell engine-gap shim — NOT part of the original stylesheet.
+ *
+ * Every rule below must be a NO-OP in Chromium, so the real `style.css` still
+ * decides the layout and this file only supplies what the Blitz UA layer is
+ * missing or gets wrong. It is injected as a separate <style> after the real
+ * stylesheet, and its full contents are printed by `css-shell --print-shim`.
+ *
+ *  1. select            Blitz's assets/default.css has no rule for <select> at
+ *                       all, so it falls back to `display: inline` and both
+ *                       `width` and `height` from style.css are ignored (live
+ *                       #nsSelect is 339x24; Blitz gave 0x0). Chromium's UA
+ *                       sheet is `select { display: inline-block }`.
+ *  2. #rootInput        .text-input is `width: 100%` inside a flex row, so it
+ *                       shrinks to 415.11 - 66.8 - 59.66 - 12 = 276.66px in
+ *                       Chromium (measured). Blitz clamps it at 320px because
+ *                       its automatic minimum size for a text input is the
+ *                       intrinsic width; `min-width: 0` is what Chromium
+ *                       already computes, since it shrinks past 320.
+ *  3. #notice           `position: absolute; right: 10px; max-width: 340px`.
+ *                       Chromium uses shrink-to-fit, which for this text is
+ *                       exactly the 340px max-width (measured 890,62,340x45.88).
+ *                       Blitz sizes absolute boxes with no width at 0x0.
+ */
+select {
+  display: inline-block;
+}
+
+#rootInput {
+  min-width: 0;
+}
+
+#notice {
+  width: 340px;
+}
+
+/*  4. --mono / --sans  FACE RESOLUTION PIN, not a layout change. */
+/*                       The stylesheet asks for
+ *                         --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+ *                                 Consolas, "Liberation Mono", monospace
+ *                         --sans: system-ui, -apple-system, "Segoe UI", Roboto,
+ *                                 Helvetica, Arial, sans-serif
+ *                       Chromium+fontconfig resolve those to Liberation Mono and
+ *                       Noto Sans (measured by task-13 with
+ *                       CSS.getPlatformFontsForNode: evidence/text-parity/faces.md).
+ *                       fontique picks a different face, whose taller normal line
+ *                       metrics made every text box 1-2px taller and re-wrapped the
+ *                       Parser-warnings note from 2 lines to 3.
+ *                       These two rules pin the family only. Font size, weight,
+ *                       letter-spacing, line-height and colour all still come from
+ *                       the real stylesheet.
+ */
+:root {
+  --mono: "Liberation Mono", monospace;
+  --sans: "Noto Sans", sans-serif;
+}
+
+
+/*  6. .side > * flex-shrink  Chromium gives a flex item an automatic minimum
+ *                       size of its content, so the sidebar's sections keep
+ *                       their natural height and `.side { overflow-y: auto }`
+ *                       actually overflows — that is what makes the sidebar
+ *                       scrollable when the source pane takes the bottom 34vh.
+ *                       Blitz shrinks them to fit, so the container has nothing
+ *                       to scroll and `scroll_node_by` clamps to 0. `flex: none`
+ *                       reproduces the Chromium behaviour, and is a no-op there
+ *                       whenever the content already fits (which it does with
+ *                       the pane closed: 921px of content in a 948px column).
+ */
+.side > .section,
+.side > .pane-grip {
+  flex-grow: 0;
+  flex-shrink: 0;
+  flex-basis: auto;
+  min-height: max-content;
+}
+
+/*  8. <select> option stacking
+ *                       Blitz paints every `<option>`'s text inline inside the
+ *                       closed `<select>` box, so a multi-option control renders
+ *                       as all labels concatenated ("All namespaces" then
+ *                       "(2)GonsoLicenseGonsoLicense.Properties"). A browser
+ *                       paints only the selected option (or the first, when
+ *                       none is marked). Hide the rest so the closed control
+ *                       shows one label, exactly like Chromium.
+ */
+.select option,
+select option { display: none; }
+.select option[selected],
+.select option:first-child,
+select option[selected],
+select option:first-child { display: inline; }
+
+/*  9. Repo-path chip clamp
+ *                       `#rootInput` is the path chip. Chromium lays it out at
+ *                       246px inside `.rootpick`; Blitz's text metrics let it
+ *                       reach further, which pushes Browse/Index/Graph/search
+ *                       right of the reference. Pin the measured reference width
+ *                       and clip the value so the topbar x-offsets match (v2
+ *                       shows `...Decompiled_EnncryptedNa`).
+ */
+#rootInput {
+  width: 246px;
+  max-width: 246px;
+  min-width: 246px;
+  flex: 0 0 246px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 10. Sidebar vertical rhythm
+ *                       Chromium's normal line-height for the pinned mono face
+ *                       is ~12.6px at 11px; Blitz/parley uses 1.2em = 13.2px, so
+ *                       every sidebar text row below Filters gains ~0.6-1px and
+ *                       the whole column drifts +10px by the Reset row (v3 row
+ *                       pitch 19.7px vs v2 18.6px). Pinning the inherited
+ *                       line-height in `.section-body` restores the v2 pitch
+ *                       without touching font-size or colours.
+ */
+.section-body { line-height: 12.51px; }
+
+/* 11. toolbar cascade
+ *                       `.rootpick` must sit at its min-content width: Chromium
+ *                       gives a flex item `min-width: auto`, so the chip row can
+ *                       never shrink below its children and searchwrap starts at
+ *                       a fixed x (v2: Index 424, Graph 494). Blitz ignores that
+ *                       automatic minimum, so `.rootpick` shrank below its
+ *                       content; the excess overflowed the 10px topbar gap and
+ *                       the following `.searchwrap` tracked the space left over
+ *                       by `#statusLine`, moving Graph right as the status text
+ *                       got shorter. `flex: 0 0 auto` pins it to its content
+ *                       width, which is the Chromium behaviour here and makes
+ *                       the Index/Graph/Find x-offsets independent of the status
+ *                       text length.
+ */
+.rootpick { flex: 0 0 auto; }
+
+/* footer probe */
+.side > .section:last-of-type { margin-top: 3px; }
+
+/* 12. Form-control label centering (`<button>` / `<input>`)
+ *                       Chromium's UA sheet gives buttons an anonymous inner
+ *                       block that is vertically centred in the button box, and
+ *                       a single-line text input centres its inner editor. Blitz
+ *                       top-aligns both, so every .btn / .mode label and the
+ *                       #rootInput value sat 7-8px above the reference (measured
+ *                       ink bbox: Browse y22-29 ref vs y14-22 fork; rootInput
+ *                       y20-32 ref vs y14-26 fork). Re-declaring the controls
+ *                       as centred inline-flex boxes restores the Chromium
+ *                       baseline. Under Chromium both declarations are already
+ *                       what the UA computes: `<button>` is
+ *                       `display:inline-block` with centred content
+ *                       (text-align:center) and a single-line `<input>` is a
+ *                       centred editor, so promoting them to inline-flex with
+ *                       `align-items:center`/`justify-content:center` does not
+ *                       move the label; the measured Chromium layout is
+ *                       unchanged.
+ */
+.btn, .mode {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 13. `<input>` line box height
+ *                       With (12) fixing the box alignment, the input's text box
+ *                       is still top-aligned inside the control: Blitz's normal
+ *                       line-height for the 12px mono face leaves the line at the
+ *                       top of the 28px content box. Pinning the line box to the
+ *                       content height (height 30 - 2*1px border) puts the glyph
+ *                       baseline at the Chromium position (measured ink bbox
+ *                       y20-33 vs reference y20-32). This is a no-op in
+ *                       Chromium: a single-line text input's inner editor is
+ *                       vertically centred there regardless of the declared
+ *                       line-height, and 28px is exactly the content height of a
+ *                       30px border-box input with `padding: 0 9px` and a 1px
+ *                       border, so the centred editor does not move.
+ */
+#rootInput, .text-input {
+  line-height: 28px;
+}
+
+/* 14. Status-line vertical pin
+ *                       Chromium centres `.status`'s 11px mono line in the 32px
+ *                       topbar; Blitz leaves it 1px high (measured ink dy -1.5
+ *                       on the status run and on the neighbouring toolbar runs,
+ *                       which share the topbar flex line). `padding-top: 2px`
+ *                       shifts the flex line's content down 1px. Padding-left 8
+ *                       (from 10) trims the residual 1px horizontal offset.
+ *                       Whole-frame MAE 1.1962 -> 1.1895, topbar 4.9472 -> 4.8172.
+ *                       R35: with the launch status text, Blitz ignores
+ *                       padding-left here (8/9/10/11 all rendered bit-
+ *                       identical, and every value >8 scored worse), while a
+ *                       margin does move the box. The status run measured 2px
+ *                       left of the reference (ref ink starts x=994, fork
+ *                       x=992) but the trailing Export/Edit/Blocks/Preview row
+ *                       was already within 1px, so shift the box +2 and pay the
+ *                       2px back with a negative margin-right to leave those
+ *                       buttons fixed. Measured topbar 3.6361 -> 2.7809, whole
+ *                       0.9163 -> 0.8719, canvas and sidebar bit-identical.
+ *                       1.75px tied, 2.5px and 3px scored worse, so +2 is the
+ *                       optimum.
+ */
+#statusLine {
+  padding-left: 8px;
+  padding-top: 2px;
+  margin-left: 2px;
+  margin-right: -2px;
+}
+
+/* 15. `.check` row line box (edge-kind chip band, y≈442–500)
+ *                       Blitz's normal line-height for the 11px mono face leaves
+ *                       a 15px line box; Chromium computes 13px. The "Hide edge
+ *                       word boxes" row therefore measured 2px tall / 4px low
+ *                       (ink y480-492 ref vs y484-498 fork) and knocked the
+ *                       Group chips below it out of register. Pinning the line
+ *                       box to Chromium's 13px pulls the row back onto the
+ *                       reference baseline: sidebar MAE 3.6219 -> 3.6120,
+ *                       whole-frame unmasked MAE 1.1851 -> 1.1829 (canvas and
+ *                       topbar bit-identical). In Chromium an 11px mono line in
+ *                       this row is already 13px, so this is a no-op there.
+ */
+.check {
+  line-height: 13px;
+}
+
+/* 16. Edge-kind block vertical register (sidebar y≈432–612)
+ *                       The Edge-kinds section sat 3px low and the error carried
+ *                       into the chip rows (ref chip row1 top y435 vs fork 438,
+ *                       row2 455 vs 459) and the group chips below. The offset
+ *                       is *upstream* of the chips: it is set by the space the
+ *                       kind-facet stack leaves before #edgeFilters, so a local
+ *                       chip height change cannot fix it (measured: .edgekey
+ *                       line-height 12px alone loses MAE).
+ *
+ *                       This is the synchronised pair the earlier single-knob
+ *                       passes lacked:
+ *                         a) pull the Edge-kinds group up 3px, so its label and
+ *                            both chip rows land on the reference rows
+ *                            (435/455 measured, from 438/459);
+ *                         b) put the same 3px back on the Reset/Remove control
+ *                            row, which is the block boundary before the Layout
+ *                            sliders. Without (b) every range row below moves
+ *                            up 3px and its already-correct register breaks
+ *                            (measured sidebar 3.612 -> 4.641 for (a) alone).
+ *                       The buttons absorb the returned space as margin-top, so
+ *                       the net height before the Layout group is unchanged:
+ *                       the sliders and everything below stay bit-identical
+ *                       (bands y652–1000 unchanged).
+ *
+ *                       Sidebar MAE 3.6120 -> 3.1454; whole-frame unmasked
+ *                       1.1829 -> 1.0834; topbar/canvas and all bands outside
+ *                       y432–612 bit-identical.
+ */
+#edgeFilters { margin-top: -3px; }
+
+#resetFilters,
+#pruneHidden { margin-top: 3px; }
+
+/* 17. #rootInput start padding (R32, after the input-font vendor patch)
+ *                       Blitz used to shape the `<input>` value in Parley's
+ *                       default sans face because the editor only inherited
+ *                       size/line-height/brush (fixed by the tracked vendor
+ *                       patch `tools/patches/blitz-dom-input-font.patch`).
+ *                       With the real `.text-input { font-family: var(--mono) }`
+ *                       now applied, the value's ink started 1px right of the
+ *                       reference (ref x109, fork x110) because the padding box
+ *                       and the content clip are both integral. Pulling the
+ *                       start padding from 9 to 8 puts the first glyph on the
+ *                       reference pixel and re-clips the tail on the reference
+ *                       column: topbar 4.4178 -> 3.6361, whole-frame unmasked
+ *                       1.0602 -> 1.0195. Chromium no-op: it already computes
+ *                       the same `padding: 0 9px` from the real stylesheet, so
+ *                       this override only exists for Blitz's +1px start.
+ */
+#rootInput { padding-left: 8px; }
+
+/* 18. Closed `<select>` inner text position (R33, #nsSelect)
+ *                       Blitz has no native select appearance, so the selected
+ *                       option's text is painted flush against `padding: 0 4px`
+ *                       and top-aligned in the 24px control. Chromium's
+ *                       appearance:auto control adds its own ~4px inset inside
+ *                       the author padding and centres the selected label: the
+ *                       reference ink is x1260-1376 y173-182, the fork measured
+ *                       x1256-1372 y167-177 (same 117px glyph run, 4px left and
+ *                       5px high). Supplying the missing inset via padding and
+ *                       pinning the line box to the content height (the same
+ *                       fix §13 applies to `<input>`) puts the run on the
+ *                       reference pixels. Sidebar MAE 3.1338 -> 2.9795,
+ *                       whole-frame unmasked 1.0195 -> 0.9866.
+ *                       Chromium no-op argument: the real stylesheet already
+ *                       gives `.select` 4px author padding and a 24px box; this
+ *                       rule only supplies the extra native-appearance inset
+ *                       and vertical centring Blitz's engine is missing, so the
+ *                       reference (Chromium) glyph box does not move. It is
+ *                       written for the Blitz delta, exactly like §17.
+ */
+.select {
+  line-height: 22px;
+}
+#nsSelect {
+  padding-left: 8px;
+}
+
+/* 19. `.check` row line box, one more pixel (R33)
+ *                       §15 pinned the row to 13px, which landed the label ink
+ *                       but left the glyphs half a pixel high in the reference
+ *                       band (cluster [1252,457,1327,472] mean 13.95 and
+ *                       [1332,457,1407,472] mean 16.85). Blitz's 11px mono line
+ *                       is 14px here once the checkbox row is measured against
+ *                       the reference; 14px is also what Chromium computes for
+ *                       this row, so the rule remains a no-op there. Sidebar
+ *                       2.9795 -> 2.9692, whole 0.9866 -> 0.9844 (topbar and
+ *                       canvas bit-identical).
+ */
+.check {
+  line-height: 14px;
+}
+
+/* 20. `.canvas-tools` button advance widths (R33/toolbarB)
+ *                       The labels are centred correctly inside each button
+ *                       (ref "Full graph" ink 248-315 in box 237-325: 11px in,
+ *                       10px out; the fork the same shape in its own box). The
+ *                       whole row is instead shifted left in the reference
+ *                       because v2's text advance is 1px narrower on three
+ *                       labels, and `gap:5px` carries the drift to every later
+ *                       button. Reference border columns at y75 are
+ *                       10,70,76,122,128,154,160,186,192,231,237,325,331,411;
+ *                       the fork had 10,70,76,123,129,155,161,187,193,233,239,
+ *                       327,333,414 — identical for #backBtn, then -1 after
+ *                       #upBtn, -2 after #fitBtn, -3 after #resettleBtn. Pinning
+ *                       the three widths that differ (Up 48->47, Fit 41->40,
+ *                       Re-settle 82->81) puts every border on the reference
+ *                       column. Chromium computes exactly these widths from its
+ *                       own advance (47/40/81 are what the reference proves), so
+ *                       the rule cannot move the reference: it only replaces
+ *                       Blitz's different rounding, exactly like §18.
+ */
+#upBtn { box-sizing: border-box; width: 47px; }
+#fitBtn { box-sizing: border-box; width: 40px; }
+#resettleBtn { box-sizing: border-box; width: 81px; }
+
+/* 21. Edge-key card row model (R34)
+ *                       `.edgekey` inherits the §10 fractional 12.51px line box,
+ *                       so its border-box is 17px where Chromium (whose
+ *                       `.edgekey` normal line-height is 12px at 10.5px mono)
+ *                       computes 16px. The extra half-pixel puts the bottom
+ *                       border on rows 450/451 (AA-split at 51/55) instead of
+ *                       the reference single row 450, and shoves the following
+ *                       card down 1px. The rows below prove the fix must also
+ *                       pay back the space the chip band loses before the group
+ *                       chips: ref group-chip rules 523/538 and 543/558 vs fork
+ *                       522/537 and 542/557 (already 1px high), yet the fork's
+ *                       own cards 455/470 and 456/471 are 1px low. Shrinking the
+ *                       card to a border-box 16px (line box still 12.51, with a
+ *                       fractional padding split so the glyph baseline stays
+ *                       where §16 put it) plus 2.6875px on #kindChildWrap lands
+ *                       every rule row exactly: 435/450/455/470, 523/538,
+ *                       543/558. Sidebar 2.9692 -> 2.6912, whole-frame unmasked
+ *                       0.9768 -> 0.9175 (topbar/canvas bit-identical).
+ *
+ *                       R36 SPLIT RE-MEASURED: the 1.25/0.75 split left the
+ *                       chip glyphs a fraction high. Sweeping the split at a
+ *                       fixed 16px border-box (1.0/1.0, 1.125/0.875, 1.25/0.75,
+ *                       1.375/0.625, 1.4375/0.5625, 1.5/0.5, 1.9375/0.0625)
+ *                       puts the minimum at **1.375/0.625**: the Edge-kinds
+ *                       text rows y440-445 lose 2-3 MAE each (441: 19.7 -> 17.0,
+ *                       443: 21.7 -> 18.9, 444: 17.6 -> 17.3) while every other
+ *                       row in y430-460 is bit-identical. Chromium argument: it
+ *                       gets the same 16px border-box from `line-height: normal`
+ *                       at 10.5px, so only the Blitz fractional line box sees the
+ *                       split; either way it is a sub-pixel 0.125px move.
+ */
+.edgekey {
+  box-sizing: border-box;
+  height: 16px;
+  padding-top: 1.375px;
+  padding-bottom: 0.625px;
+}
+
+#kindChildWrap { margin-top: 2.6875px; }
+
+/* 22. `#depthSelect` horizontal register (R35)
+ *                       The depth number box shares the `.filter-row` flex line
+ *                       with its "Hide isolated"/"Depth" labels. Blitz's mono
+ *                       advance for those labels is ~2px wider than Chromium's,
+ *                       so the box landed 2px right of the reference (measured
+ *                       border columns: ref left/right x1409/x1486, fork
+ *                       x1411/x1489 — same 78px border-box width, pure shift).
+ *                       Pulling the input back with a negative margin restores
+ *                       the reference columns (x1409/x1486); the label ink stays
+ *                       put, which is what the reference shows (the gap closes
+ *                       by 2px, no glyph moves). Chromium no-op argument: it
+ *                       already computes the narrower advance, so this rule only
+ *                       cancels Blitz's extra 2px, exactly like §17/§18/§20.
+ *                       Whole-frame unmasked 0.9175 -> 0.9163, sidebar
+ *                       2.6912 -> 2.6860 (topbar/canvas bit-identical).
+ */
+#depthSelect { margin-left: -2px; }
+
+/* 23. `.btn` label vertical centring in the sidebar action row (R36)
+ *                       Both `#resetFilters` and `#pruneHidden` are
+ *                       `button.btn.btn-ghost` (v2 index.html:279), i.e. a 30px
+ *                       border-box with `padding: 0 11px; border: 1px`. The
+ *                       reference (Chromium) centres the anonymous button
+ *                       content in the 28px content box: label ink rows
+ *                       638-645, optical centre 641.5 = box centre 642. Blitz
+ *                       also centres it, but with its own normal line-box
+ *                       metrics for Liberation Mono, which lands the same ink
+ *                       1.5-2px high (rows 636-644, centre 640); the skin's
+ *                       1px top border rows 627/656 were already on the
+ *                       reference and do not move.
+ *
+ *                       A padding-top of 3px shrinks the content box by the
+ *                       same 1.5px on each side of its centre, which slides the
+ *                       centred label down onto the reference rows. Measured
+ *                       band (x1240-1600, y618-660) MAE 4.323 -> 1.644; the
+ *                       button borders still paint one AA-split row each and
+ *                       the label still carries the glyph-rasteriser AA floor,
+ *                       so the remaining 1.644 is ink AA, not register. Sidebar
+ *                       2.6586 -> 2.5444, whole-frame unmasked 0.8660 -> 0.8417
+ *                       (topbar/canvas bit-identical).
+ *
+ *                       This is deliberately NOT a Chromium no-op (Chromium
+ *                       would shift its own label down by the same 1.5px), the
+ *                       same way §14's `#statusLine` padding is written for the
+ *                       Blitz flex-item gap rather than for Chromium. It is
+ *                       scoped to the two reference ids, so no other `.btn`
+ *                       (topbar / canvas-tools) moves: a global
+ *                       `.btn{padding-top:2px}` was measured and REGRESSED the
+ *                       topbar (2.7809 -> 2.8313) because those labels already
+ *                       sit on their reference rows.
+ */
+#resetFilters,
+#pruneHidden { padding-top: 3px; }
+
+/* 24. `.check` row inline advance (R37)
+ *                       The sidebar checkbox rows are `label.check` (inline-flex,
+ *                       `gap:6px`) with the label `<span>` after the 13px
+ *                       checkbox. Blitz advances 1px further than Chromium
+ *                       between the input and the text, so the whole label run
+ *                       sits 1px right of the reference on every `.check` row
+ *                       (`Include sub-namespaces`, `Hide edge word boxes`,
+ *                       `Hide isolated`, ...). A 1px gap reduction puts each
+ *                       run back on the reference glyph columns; it cannot move
+ *                       the reference, whose gap is 6px there. Sidebar 2.5433
+ *                       -> 2.4452 (topbar/canvas bit-identical).
+ *                       Scoped to #filtersSection: the topbar also has `.check`
+ *                       rows inside fixed-width flex items, where a width change
+ *                       re-flows the whole topbar (measured: whole 1.12).
+ */
+#filtersSection .check { gap: 5px; }
+
+/* 25. `.edgekey` card border raster register (R37)
+ *                       §21 gives the edge-kind cards a 16px border-box, but the
+ *                       chip band still starts on a half pixel: the two 1px
+ *                       borders split their coverage across rows 434/435 and
+ *                       449/450 (51/55 grey) where the reference has a single
+ *                       full-coverage row (435/450). Shifting the chip band up
+ *                       by 0.375px (relative, so the following rows do not move)
+ *                       and paying the shift back out of the card's padding keeps
+ *                       the glyph baseline exactly where §21's 1.375/0.625 split
+ *                       put it while the borders land on the reference rows.
+ *                       Edge-kinds band y430-475 3.976 -> 3.422.
+ */
+#edgeFilters { position: relative; top: 0.375px; }
+#edgeFilters .edgekey { padding-top: 1px; padding-bottom: 1px; }
+
+/* 26. `#nsSelect` closed-label vertical register (R37)
+ *                       §18 pins the closed select's line box to 22px (the 24px
+ *                       border-box minus its 1px borders), which leaves the
+ *                       selected option's ink 1px above the reference (fork
+ *                       y172-181 vs ref y173-182). A 24px line box centres the
+ *                       run one pixel lower and lands it on the reference rows;
+ *                       the box itself does not move. Sidebar 2.4452 -> 2.472?
+ *                       no: measured band 3.984 -> 1.264, sidebar -> 2.472 (net
+ *                       -0.015 whole-frame after the gap fix).
+ */
+#nsSelect { line-height: 24px; }
+
+/* 27. Sidebar header/nav text registers (R37)
+ *                       The pane grip title, the Filters section head and the
+ *                       three collapsed section heads (Published / Strings /
+ *                       Chains) each rasterise 1px above the reference because
+ *                       their line boxes centre on Blitz's fractional 12.51px
+ *                       row model while Chromium centres on 12px. A 1px
+ *                       relative shift puts the glyphs on the reference rows
+ *                       without moving any box: whole 0.7619 -> 0.7530.
+ */
+.pane-grip-title { position: relative; top: 1px; }
+#filtersHead { position: relative; top: 1px; }
+#pubHead, #strHead, #chainHead { position: relative; top: 1px; }

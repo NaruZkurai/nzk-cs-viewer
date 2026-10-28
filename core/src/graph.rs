@@ -12,6 +12,59 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Map, Value};
 
+// ---------------------------------------------------------------------------
+// per-reference instrumentation (`CSGRAPH_BUILD_TIMING=1` only)
+//
+// `resolve_ref` has many early returns, so an RAII guard records on drop
+// instead of at every exit. The accumulator is thread-local: it must not be
+// reachable from `&mut self` while the body mutates the graph.
+// ---------------------------------------------------------------------------
+thread_local! {
+    static RESOLVE_PROF: std::cell::RefCell<HashMap<&'static str, (u64, u128)>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+fn resolve_prof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CSGRAPH_BUILD_TIMING").is_some())
+}
+
+struct ResolveGuard {
+    kind: &'static str,
+    t: std::time::Instant,
+}
+
+impl ResolveGuard {
+    fn new(kind: &str) -> Self {
+        let kind = match kind {
+            "construct" => "construct",
+            "call" => "call",
+            _ => "use",
+        };
+        ResolveGuard { kind, t: std::time::Instant::now() }
+    }
+}
+
+impl Drop for ResolveGuard {
+    fn drop(&mut self) {
+        let ns = self.t.elapsed().as_nanos();
+        RESOLVE_PROF.with(|c| {
+            let mut m = c.borrow_mut();
+            let e = m.entry(self.kind).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += ns;
+        });
+    }
+}
+
+fn prof_guard(kind: &'static str) -> Option<ResolveGuard> {
+    if resolve_prof_on() {
+        Some(ResolveGuard { kind, t: std::time::Instant::now() })
+    } else {
+        None
+    }
+}
+
 use crate::hash::md5_hex;
 use crate::model::{is_keyword, strip_ws};
 use crate::parser::qualified_re;
@@ -27,7 +80,11 @@ pub struct GraphBuilder {
     types_by_name: HashMap<String, Vec<String>>,
     types_by_full: HashMap<String, String>,
     members_by_name: HashMap<String, Vec<String>>,
-    by_owner_name: HashMap<(String, String), Vec<String>>,
+    /// `owner -> member name -> ids`. Nested rather than keyed by
+    /// `(owner, name)` so the hot `resolve_ref` lookup borrows both strings
+    /// instead of allocating a tuple per owner per reference (measured: the
+    /// owner lookup was ~45-49 % of `resolve.call`).
+    by_owner_name: HashMap<String, HashMap<String, Vec<String>>>,
     fields_by_owner: HashMap<String, HashMap<String, Vec<String>>>,
     var_types: HashMap<String, Value>,
     bases: HashMap<String, Vec<String>>,
@@ -183,7 +240,9 @@ impl GraphBuilder {
                     .or_default()
                     .push(mid.clone());
                 self.by_owner_name
-                    .entry((owner.clone(), name.clone()))
+                    .entry(owner.clone())
+                    .or_default()
+                    .entry(name.clone())
                     .or_default()
                     .push(mid.clone());
                 let kind = vs(m, "kind");
@@ -583,8 +642,28 @@ impl GraphBuilder {
         }
     }
 
+    /// Allocation-free `node_kind(id) in kinds`, for the hot `resolve_ref`
+    /// branches: `node_kind` builds a `String` per call, and the owner-lookup
+    /// and glob paths call it per candidate.
+    fn kind_is(&self, id: &str, kinds: &[&str]) -> bool {
+        match self.node_ix.get(id) {
+            Some(&ix) => self.nodes[ix]
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .map(|k| kinds.contains(&k))
+                .unwrap_or(false),
+            None => false,
+        }
+    }
+
+
     /// `_resolve_ref(r, m)`.
     fn resolve_ref(&mut self, r: &Value, m: &Value) {
+        let _prof = if resolve_prof_on() {
+            Some(ResolveGuard::new(r.get("kind").and_then(|v| v.as_str()).unwrap_or("")))
+        } else {
+            None
+        };
         let mid = vs(m, "id");
         let name = vs(r, "name");
         let q = r.get("qual").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -615,82 +694,92 @@ impl GraphBuilder {
             return;
         }
         if kind == "call" {
-            let owners: Option<Vec<String>> = match &q {
-                Some(q) => Some(self.q_types(q, m)),
-                None => None,
-            };
-            let m_owner = vs(m, "owner");
-            let m_ns = vs(m, "ns");
-            let mut tiers: Vec<Vec<String>> = Vec::new();
-            if q.is_none() || owners.is_some() {
+            let owners: Option<Vec<String>> = {
+                let _g = prof_guard("call.q_types");
                 match &q {
-                    None => {
-                        tiers.push(if m_owner.is_empty() {
-                            Vec::new()
-                        } else {
-                            vec![m_owner.clone()]
-                        });
-                        tiers.push(if m_owner.is_empty() {
-                            Vec::new()
-                        } else {
-                            self.bases_of(&m_owner)
-                        });
-                        tiers.push(self.ns_types.get(&m_ns).cloned().unwrap_or_default());
-                    }
-                    Some(_) => {
-                        let owners = owners.clone().unwrap_or_default();
-                        tiers.push(owners.clone());
-                        let mut second: Vec<String> = Vec::new();
-                        for o in &owners {
-                            second.extend(self.bases_of(o));
+                    Some(q) => Some(self.q_types(q, m)),
+                    None => None,
+                }
+            };
+            let mut tiers: Vec<Vec<String>> = Vec::new();
+            {
+                let _g = prof_guard("call.tiers");
+                let m_owner = vs(m, "owner");
+                let m_ns = vs(m, "ns");
+                if q.is_none() || owners.is_some() {
+                    match &q {
+                        None => {
+                            tiers.push(if m_owner.is_empty() {
+                                Vec::new()
+                            } else {
+                                vec![m_owner.clone()]
+                            });
+                            tiers.push(if m_owner.is_empty() {
+                                Vec::new()
+                            } else {
+                                self.bases_of(&m_owner)
+                            });
+                            tiers.push(self.ns_types.get(&m_ns).cloned().unwrap_or_default());
                         }
-                        tiers.push(second);
+                        Some(_) => {
+                            let owners = owners.clone().unwrap_or_default();
+                            tiers.push(owners.clone());
+                            let mut second: Vec<String> = Vec::new();
+                            for o in &owners {
+                                second.extend(self.bases_of(o));
+                            }
+                            tiers.push(second);
+                        }
                     }
                 }
             }
-            for tier in tiers {
-                let mut found: Vec<String> = Vec::new();
-                for o in &tier {
-                    if let Some(ids) = self.by_owner_name.get(&(o.clone(), name.clone())) {
-                        found.extend(ids.iter().cloned());
-                    }
-                }
-                if !found.is_empty() {
-                    for t in found {
-                        let k = if matches!(self.node_kind(&t).as_str(), "property" | "field" | "event")
+            {
+                let _g = prof_guard("call.owner_lookup");
+                for tier in tiers {
+                    let mut found: Vec<String> = Vec::new();
+                    for o in &tier {
+                        if let Some(ids) =
+                            self.by_owner_name.get(o).and_then(|m| m.get(name.as_str()))
                         {
-                            "uses"
-                        } else {
-                            "calls"
-                        };
-                        self.edge(&mid, &t, k, line, false);
+                            found.extend(ids.iter().cloned());
+                        }
                     }
-                    return;
+                    if !found.is_empty() {
+                        for t in found {
+                            let k = if self.kind_is(&t, &["property", "field", "event"]) {
+                                "uses"
+                            } else {
+                                "calls"
+                            };
+                            self.edge(&mid, &t, k, line, false);
+                        }
+                        return;
+                    }
                 }
             }
             if q.is_some() && owners.as_ref().map(|o| !o.is_empty()).unwrap_or(false) {
                 return;
             }
-            let mut glob = self.members_by_name.get(&name).cloned().unwrap_or_default();
-            glob.retain(|g| {
-                matches!(
-                    self.node_kind(g).as_str(),
-                    "method" | "constructor" | "operator" | "property"
-                )
-            });
-            let amb = glob.len() > 1;
-            for t in glob.iter().take(12) {
-                let k = if self.node_kind(t) == "property" {
-                    "uses"
-                } else {
-                    "calls"
-                };
-                self.edge(&mid, t, k, line, amb);
-            }
-            if glob.is_empty() {
-                if let Some(q) = &q {
-                    if let Some(eid) = self.external(q) {
-                        self.edge(&mid, &eid, "uses", line, false);
+            {
+                let _g = prof_guard("call.glob");
+                let mut glob = self.members_by_name.get(&name).cloned().unwrap_or_default();
+                glob.retain(|g| {
+                    self.kind_is(g, &["method", "constructor", "operator", "property"])
+                });
+                let amb = glob.len() > 1;
+                for t in glob.iter().take(12) {
+                    let k = if self.kind_is(t, &["property"]) {
+                        "uses"
+                    } else {
+                        "calls"
+                    };
+                    self.edge(&mid, t, k, line, amb);
+                }
+                if glob.is_empty() {
+                    if let Some(q) = &q {
+                        if let Some(eid) = self.external(q) {
+                            self.edge(&mid, &eid, "uses", line, false);
+                        }
                     }
                 }
             }
@@ -977,14 +1066,45 @@ impl GraphBuilder {
 
 /// `build_graph(parses, roots=None)`.
 pub fn build_graph(parses: &[Value]) -> GraphBuilder {
+    let timing = std::env::var_os("CSGRAPH_BUILD_TIMING").is_some();
     let mut gb = GraphBuilder::new();
+    let t = std::time::Instant::now();
     for pr in parses {
         gb.register(pr);
+    }
+    if timing {
+        eprintln!("[timing]   graph.register {}ms", t.elapsed().as_millis());
+    }
+    let t = std::time::Instant::now();
+    if timing {
+        RESOLVE_PROF.with(|c| c.borrow_mut().clear());
     }
     for pr in parses {
         gb.resolve(pr);
     }
+    if timing {
+        eprintln!("[timing]   graph.resolve {}ms", t.elapsed().as_millis());
+        RESOLVE_PROF.with(|c| {
+            let m = c.borrow();
+            let total: u128 = m.values().map(|v| v.1).sum();
+            let mut rows: Vec<(&str, u64, u128)> =
+                m.iter().map(|(k, v)| (*k, v.0, v.1)).collect();
+            rows.sort_by_key(|(_, _, ns)| std::cmp::Reverse(*ns));
+            for (k, n, ns) in rows {
+                eprintln!(
+                    "[timing]     resolve.{k} n={n} total={:.0}ms mean={:.1}us share={:.0}%",
+                    ns as f64 / 1e6,
+                    (ns as f64 / 1e3) / (n as f64).max(1.0),
+                    ns as f64 * 100.0 / (total.max(1) as f64)
+                );
+            }
+        });
+    }
+    let t = std::time::Instant::now();
     gb.finish();
+    if timing {
+        eprintln!("[timing]   graph.finish {}ms", t.elapsed().as_millis());
+    }
     gb
 }
 

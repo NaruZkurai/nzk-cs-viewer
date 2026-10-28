@@ -1532,6 +1532,15 @@ pub fn parse_source(path: &Path, display: &str, defines: Option<&HashSet<String>
 // discovery
 // ---------------------------------------------------------------------------
 /// `_excluded(rel, parts, excludes)`.
+///
+/// **Hot path.** `parts` already contains every path component of `rel`, so a
+/// glob-free exclude (`target`, `cache`, …) is fully decided by
+/// `parts.contains(ex)`: `fnmatch(rel, ex)`, `fnmatch(rel, "*/{ex}")` and
+/// `fnmatch(rel, "{ex}/*")` can only match when some component equals `ex`.
+/// Skipping the `fnmatch` calls for plain names matters because `fnmatch`
+/// builds a fresh matcher via `fnmatch_translate` on **every** call, and this
+/// function runs once per directory with up to three calls per exclude — the
+/// measured 65 % discovery hotspot.
 pub fn excluded(rel: &str, parts: &HashSet<String>, excludes: &[String]) -> bool {
     for ex in excludes {
         if ex.is_empty() {
@@ -1539,6 +1548,9 @@ pub fn excluded(rel: &str, parts: &HashSet<String>, excludes: &[String]) -> bool
         }
         if parts.contains(ex) {
             return true;
+        }
+        if !has_glob(ex) {
+            continue;
         }
         if fnmatch(rel, ex) || fnmatch(rel, &format!("*/{ex}")) {
             return true;
@@ -1548,6 +1560,11 @@ pub fn excluded(rel: &str, parts: &HashSet<String>, excludes: &[String]) -> bool
         }
     }
     false
+}
+
+/// `true` when `pat` can match more than one literal name.
+fn has_glob(pat: &str) -> bool {
+    pat.bytes().any(|b| matches!(b, b'*' | b'?' | b'['))
 }
 
 /// `is_cs(name)`.
@@ -1626,7 +1643,10 @@ fn regex_escape_char(c: char) -> String {
 pub fn discover_files(base: &Path, roots: &[String], excludes: &[String]) -> Vec<String> {
     let mut files: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut visited: HashSet<PathBuf> = HashSet::new();
+    // Directory identity is `(st_dev, st_ino)` from the lstat we already make
+    // for the entry: no `canonicalize` per directory, and still a full cycle
+    // guard for symlinks, bind mounts and overlayfs duplicates alike.
+    let mut visited: HashSet<(u64, u64)> = HashSet::new();
     for root in roots {
         let p = if Path::new(root).is_absolute() {
             PathBuf::from(root)
@@ -1634,17 +1654,28 @@ pub fn discover_files(base: &Path, roots: &[String], excludes: &[String]) -> Vec
             base.join(root)
         };
         let p = normalize_path(&p);
-        if p.is_file() {
+        let Ok(md) = std::fs::metadata(&p) else { continue };
+        if md.is_file() {
             let s = p.to_string_lossy().to_string();
             if is_cs(&s) && seen.insert(s.clone()) {
                 files.push(s);
             }
             continue;
         }
-        walk_collect(&p, "", excludes, &mut files, &mut seen, &mut visited);
+        if !md.is_dir() {
+            continue;
+        }
+        let ident = ident_of(&md);
+        walk_collect(&p, "", excludes, &mut files, &mut seen, &mut visited, ident);
     }
     files.sort();
     files
+}
+
+/// `(st_dev, st_ino)` — one directory's identity, without `canonicalize`.
+fn ident_of(md: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (md.dev(), md.ino())
 }
 
 fn normalize_path(p: &Path) -> PathBuf {
@@ -1663,25 +1694,36 @@ fn normalize_path(p: &Path) -> PathBuf {
 }
 
 /// `true` when the path itself is a link rather than the thing it names.
+#[allow(dead_code)]
 fn is_link(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
 }
 
+/// Walk one directory tree.
+///
+/// `ident` is the directory's `(st_dev, st_ino)` identity; it is inserted into
+/// `visited` before the directory is read, so a symlink cycle, a second link
+/// onto the same tree, or the same directory surfaced twice by a bind mount /
+/// overlay filesystem is walked exactly once. This replaces a `canonicalize`
+/// per directory (several syscalls) with one integer-pair insert.
+///
+/// Per entry this makes **one** `symlink_metadata` call instead of `is_dir()`
+/// plus `is_link()` (two stats); a symlinked entry's target is stat'ed once,
+/// for both its kind and its identity.
 fn walk_collect(
     dir: &Path,
     rel: &str,
     excludes: &[String],
     files: &mut Vec<String>,
     seen: &mut HashSet<String>,
-    visited: &mut HashSet<PathBuf>,
+    visited: &mut HashSet<(u64, u64)>,
+    ident: (u64, u64),
 ) {
-    // The canonical path is the identity of the real directory: a symlink cycle
-    // (or a second link onto the same tree) stops here instead of walking it
-    // again. When two paths name the same folder, the first one walked wins.
-    let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    if !visited.insert(key) {
+    // Identity, not path: inserted before the directory is read, so a cycle or
+    // a second name for the same directory stops here.
+    if !visited.insert(ident) {
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -1690,20 +1732,34 @@ fn walk_collect(
     let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
     entries.sort();
     // Real subfolders are walked before linked ones, so the untouched tree
-    // claims the canonical slot and keeps its own paths in the index.
-    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
-    let mut linked_dirs: Vec<(String, PathBuf)> = Vec::new();
+    // claims its identity slot and keeps its own paths in the index.
+    let mut dirs: Vec<(String, PathBuf, (u64, u64))> = Vec::new();
+    let mut linked_dirs: Vec<(String, PathBuf, (u64, u64))> = Vec::new();
     for path in entries {
         let name = match path.file_name() {
             Some(n) => n.to_string_lossy().to_string(),
             None => continue,
         };
-        if path.is_dir() {
-            if is_link(&path) {
-                linked_dirs.push((name, path));
-            } else {
-                dirs.push((name, path));
+        // One lstat per entry: `file_type()` from the same call tells us
+        // file/dir/link, instead of `is_dir()` + `is_link()` (two stats).
+        let Ok(md) = std::fs::symlink_metadata(&path) else { continue };
+        let ft = md.file_type();
+        if ft.is_symlink() {
+            match std::fs::metadata(&path) {
+                Ok(target) if target.is_dir() => {
+                    linked_dirs.push((name, path, ident_of(&target)))
+                }
+                Ok(target) if target.is_file() && is_cs(&name) => {
+                    let s = path.to_string_lossy().to_string();
+                    if seen.insert(s.clone()) {
+                        files.push(s);
+                    }
+                }
+                _ => {}
             }
+        } else if ft.is_dir() {
+            let id = ident_of(&md);
+            dirs.push((name, path, id));
         } else if is_cs(&name) {
             let s = path.to_string_lossy().to_string();
             if seen.insert(s.clone()) {
@@ -1711,7 +1767,7 @@ fn walk_collect(
             }
         }
     }
-    for (name, path) in dirs.into_iter().chain(linked_dirs) {
+    for (name, path, id) in dirs.into_iter().chain(linked_dirs) {
         let child_rel = if rel.is_empty() {
             name.clone()
         } else {
@@ -1726,7 +1782,7 @@ fn walk_collect(
         if excluded(&child_rel, &parts, excludes) {
             continue;
         }
-        walk_collect(&path, &child_rel, excludes, files, seen, visited);
+        walk_collect(&path, &child_rel, excludes, files, seen, visited, id);
     }
 }
 
@@ -1751,6 +1807,55 @@ pub fn display_path(path: &Path, repo: &Path) -> String {
 mod tests {
     use super::*;
     use crate::model::to_chars;
+
+    /// The skipped-`fnmatch` fast path must not change which paths are excluded.
+    ///
+    /// `parts` is, by contract, the component set **of `rel`** — both real
+    /// callers (`walk_collect`, `bounded_walk_check`) build it by splitting the
+    /// same path they pass. The first version of this test passed a component
+    /// set taken from a different path (`a/target` while querying `a/src`),
+    /// which made `parts.contains("target")` fire; that input is not one the
+    /// function supports, and the test was wrong, not the code.
+    #[test]
+    fn excluded_plain_names_and_globs_agree() {
+        fn parts_of(rel: &str) -> HashSet<String> {
+            rel.split('/')
+                .filter(|p| !p.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        }
+        let ex = vec!["target".to_string(), "*.gen".to_string(), "obj".to_string()];
+        // plain name: the component set decides it
+        assert!(excluded("a/target", &parts_of("a/target"), &ex));
+        assert!(excluded("a/target/x", &parts_of("a/target/x"), &ex));
+        assert!(!excluded("a/src", &parts_of("a/src"), &ex));
+        assert!(!excluded("a/objx", &parts_of("a/objx"), &ex));
+        // glob: still matched by fnmatch even when no component equals it
+        assert!(excluded("a/foo.gen", &parts_of("a/foo.gen"), &ex));
+        assert!(excluded("foo.gen", &parts_of("foo.gen"), &ex));
+    }
+
+    /// A symlink cycle and a second name for the same directory must each be
+    /// walked once: the identity guard is `(st_dev, st_ino)`, not the path.
+    #[test]
+    fn discover_files_visits_a_symlink_cycle_once() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("csgraph-discover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("a/b")).unwrap();
+        std::fs::write(base.join("a/One.cs"), "class One {}").unwrap();
+        std::fs::write(base.join("a/b/Two.cs"), "class Two {}").unwrap();
+        symlink(base.join("a"), base.join("a/loop")).unwrap();
+        symlink(base.join("a/b"), base.join("a/b/sibling")).unwrap();
+
+        let got = discover_files(&base, &[".".to_string()], &[]);
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.rsplit('/').next().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["One.cs".to_string(), "Two.cs".to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn parse_param_strips_modifiers_and_brackets() {

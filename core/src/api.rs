@@ -425,6 +425,17 @@ fn do_get(index: &mut Index, path: &str, query: &Value) -> (u16, Value) {
             }),
         ),
         "/api/viewer_state" => (200, json!({"ok": true, "state": index.viewer_state()})),
+        // Read-only: which cs viewer instances are live (cross-user registry +
+        // bounded /proc fallback), and the selected instance's POV (Monaco text
+        // selection, graph box selection, loose IDE context) with freshness.
+        "/api/viewer_instances" => {
+            let selector = qfirst(query, "instance");
+            (200, index.viewer_instances(selector.as_deref()))
+        }
+        "/api/viewer_pov" => {
+            let selector = qfirst(query, "instance");
+            (200, index.viewer_pov(selector.as_deref()))
+        }
         "/api/settings" => (
             200,
             json!({

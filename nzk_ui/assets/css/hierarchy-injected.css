@@ -1,0 +1,49 @@
+/* CSS that `hierarchy.js` `injectStyle()` (lines 355-384) appends to <head> at
+ * runtime as `<style id="cs-hier-style">`. Reproduced verbatim — the
+ * concatenation of that array, which is what `.join('\n')` produces.
+ *
+ * This file exists for the same reason `problems-injected.css` does: the
+ * classes below are defined by NO rule in `static/style.css`, so without them
+ * the hierarchy panel exists in the layout but has no box, no border and no
+ * typography. `css-shell` has no JS engine, so the Rust DOM layer emits this
+ * block itself (see `dom.rs` `inline_stylesheets`).
+ *
+ * IMPORTANT — what is deliberately NOT here:
+ *
+ * The renderer also uses `.hop`, `.hop-caret`, `.hop-edge`, `.hop-line`,
+ * `.hop-label`, `.hop-cycle` and `.cs-hier-empty`, but `injectStyle()` does not
+ * define the `.hop*` family. Those live in the REAL stylesheet
+ * (`static/style.css:1634-1660`, sharing the "Resolve chain" drawer's rows,
+ * with `nzk-dark+` theme overrides at 1990-1991). Copying them here would
+ * duplicate the cascade and freeze them against theme changes, which is exactly
+ * the drift this architecture is built to avoid. Only the injected rules belong
+ * in this file.
+ *
+ * `--border-soft`, `--text`, `--mono`, `--bg-input`, `--border` and `--text-faint`
+ * are all defined on `:root` by the shipped stylesheet, and every use here
+ * carries the reference's own literal fallback, so the block is correct whether
+ * or not the variables resolve. There is no `@font-face` or `url()` in it, so
+ * nothing needs rewriting for the offline shell.
+ */
+
+.cs-hier { position: fixed; z-index: 60; width: 380px; display: flex; flex-direction: column;
+  background: #0f1320; border: 1px solid var(--border-soft, #2a3550); border-radius: 6px;
+  box-shadow: 0 12px 30px rgba(0,0,0,.45); font-family: var(--mono, monospace); overflow: hidden; }
+.cs-hier-head { display: flex; align-items: center; gap: 6px; padding: 6px 8px;
+  border-bottom: 1px solid var(--border-soft, #2a3550); background: #131a2b; }
+.cs-hier-title { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text, #d4d4d4); font-size: 11px; font-weight: 600; }
+.cs-hier-sub { color: var(--text-faint, #858585); font-size: 9.5px; font-weight: 400; }
+.cs-hier-controls { display: flex; align-items: center; gap: 4px; padding: 4px 8px;
+  border-bottom: 1px solid var(--border-soft, #2a3550); }
+.cs-hier-select { height: 20px; background: var(--bg-input, #10141f); color: var(--text, #d4d4d4);
+  border: 1px solid var(--border, #2a3550); border-radius: 4px; font-family: var(--mono, monospace); font-size: 10px; }
+.cs-hier-btn { background: none; border: 1px solid var(--border, #2a3550); border-radius: 4px;
+  color: var(--text-faint, #858585); font-size: 10px; cursor: pointer; padding: 1px 5px; }
+.cs-hier-btn:hover { color: var(--text, #d4d4d4); background: #1e2740; }
+.cs-hier-body { overflow: auto; padding: 3px 0; min-height: 36px; }
+.cs-hier-section { padding: 5px 8px 2px; color: var(--text-faint, #858585); font-size: 9px;
+  text-transform: uppercase; letter-spacing: .07em; }
+.cs-hier-empty { padding: 7px 9px; color: var(--text-faint, #858585); font-size: 10.5px; }
+.cs-hier-kind { flex: none; color: var(--type, #4ec9b0); font-size: 9px; border: 1px solid #23414d;
+  border-radius: 6px; padding: 0 3px; }

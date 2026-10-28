@@ -1,20 +1,24 @@
-# csviewer v2 — the RUST-ONLY viewer.
+# cs viewer v3 — the native, engine-free C# relation-graph viewer.
 #
-# A cargo workspace: `core` is the whole csgraph engine (parser, graph, doc,
-# reorg, cache) with no GUI dependency at all; `app` is the Tauri host that
-# serves the frontend and answers its /api/* calls in-process.
+# This is a cargo workspace: `app` is the winit + wgpu + egui host. The
+# csgraph engine (`core`, reused read-only) is a workspace member; the three
+# IDE addons are git dependencies pinned by commit in `app/Cargo.toml`.
+# `nzk_ui` is its own workspace because it renders the real HTML/CSS shell
+# with Blitz/Stylo/Vello.
 #
-# The only Python left in v2 is the CS splitter (python/splitter/). Nothing
-# here shells out to Python for the graph.
+# There is no browser engine anywhere: no Tauri, wry, WebKitGTK, GTK,
+# WebView2, JavaScriptCore, or JS runtime.
 [workspace]
 resolver = "2"
-members = ["core", "app"]
+members = ["app", "core"]
+# nzk_ui is a separate workspace (its own lock/target).
+exclude = ["nzk_ui"]
 
 [workspace.package]
-version = "2.0.0"
+version = "3.0.0-beta.9"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/nzk/csviewer"
+repository = "https://github.com/NaruZkurai/nzk-cs-viewer"
 
 [profile.release]
 opt-level = "s"

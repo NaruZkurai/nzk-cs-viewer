@@ -1,19 +1,43 @@
 [package]
-name = "csviewer"
-description = "CS Viewer v2 — native window for the csgraph C# relation graph (Rust engine)"
+name = "native-csviewer"
+description = "Engine-free native CS Viewer: winit window + wgpu GPU + egui panels (no browser engine)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "csviewer"
+name = "native-csviewer"
 path = "src/main.rs"
 
 [dependencies]
+# The engine, reused read-only by path. It is never edited from this fork.
 csgraph-core = { path = "../core" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tauri = { version = "2", features = [] }
 
-[build-dependencies]
-tauri-build = "2"
+egui = { version = "0.37", features = ["default_fonts"] }
+egui-wgpu = { version = "0.37", features = ["winit", "x11", "wayland"] }
+egui-winit = { version = "0.37", default-features = false, features = [
+    "clipboard",
+    "links",
+    "x11",
+    "wayland",
+] }
+wgpu = { version = "30", default-features = false, features = [
+    "std",
+    "vulkan",
+    "gles",
+    "wgsl",
+    "parking_lot",
+] }
+winit = "0.30.13"
+pollster = "0.4"
+serde_json = "1"
+# The VSCode-like source IDE pane lives in its own repo and is pinned to a
+# commit (the host supplies the graph through its `Language` trait).
+nzkide-module = { git = "https://github.com/NaruZkurai/nzk-cs-nzkide_module.git", branch = "main" }
+# The Scratch puzzle-piece pane lives in its own repo; it has no csgraph
+# knowledge, only host-neutral data.
+scratch-rs-ide-addon = { git = "https://github.com/NaruZkurai/nzk-csViewer-scratch_rs_ide_addon.git", branch = "main" }
+# Global definition token numbers (the def2mcpfnnumber addon); see
+# app/src/tokens.rs for the graph bridge and `--tokens` for the smoke test.
+def2mcpfnnumber = { git = "https://github.com/NaruZkurai/nzk-cs-def2mcpfnnumber_rs_ide_addon.git", branch = "main" }
+image = { version = "0.25", default-features = false, features = ["png"] }

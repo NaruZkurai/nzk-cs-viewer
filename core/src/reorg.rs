@@ -35,6 +35,7 @@ use serde_json::{json, Map, Value};
 
 use crate::doc::{DocBuilder, DocCache, TYPE_KINDS};
 use crate::graph::build_graph;
+use crate::guard::{first_managed_dir, WriteScope};
 use crate::hash::sha1_hex;
 use crate::lex::mask_noncode;
 use crate::model::{
@@ -323,6 +324,11 @@ pub struct Reorg {
     child_index: RefCell<Option<HashMap<String, HashSet<String>>>>,
     /// full type name -> simple name, for the partial rewriter.
     type_names: HashMap<String, String>,
+    /// The write scope `write_tree` must obey. `None` means the caller did not
+    /// supply an [`Index`] (see [`Reorg::set_write_scope`]); `write_tree` then
+    /// falls back to the process's own `--repo`/`--root` binding, and enforces
+    /// at least the engine/Unity-managed directory denial.
+    write_scope: Option<WriteScope>,
 }
 
 impl Reorg {
@@ -367,7 +373,16 @@ impl Reorg {
             site_cache: RefCell::new(HashMap::new()),
             child_index: RefCell::new(None),
             type_names,
+            write_scope: None,
         }
+    }
+
+    /// Confine [`Reorg::write_tree`] to `scope`. A caller that holds an
+    /// [`Index`](crate::index::Index) must pass
+    /// [`WriteScope::for_index`](crate::guard::WriteScope::for_index) here; the
+    /// stdio MCP server that does not is covered by the process args fallback.
+    pub fn set_write_scope(&mut self, scope: WriteScope) {
+        self.write_scope = Some(scope);
     }
 
     fn kind_of(&self, uid: &str) -> String {
@@ -1604,6 +1619,29 @@ impl Reorg {
             return json!({"ok": false, "error": "destination must be an absolute path"});
         }
         let dest = normpath(dest);
+        // The central write-scope guard: a destination outside the bound
+        // repository/root, or inside an engine/Unity-managed directory
+        // (`Library/`, `ProjectSettings/`, …), is refused before anything is
+        // created. `Reorg` carries no `Index`, so the scope is either set by
+        // the caller or read from this process's own `--repo`/`--root` binding.
+        let dest_path = Path::new(&dest);
+        match self.write_scope.clone().or_else(WriteScope::from_process_args) {
+            Some(scope) => {
+                if let Err(e) = scope.check(dest_path) {
+                    return json!({"ok": false, "dest": dest, "error": e});
+                }
+            }
+            None => {
+                if let Some(dir) = first_managed_dir(dest_path, true) {
+                    let e = format!(
+                        "write-scope refusal: destination {dest:?} is inside the \
+                         engine-managed directory {dir:?}; engine/Unity-managed \
+                         directories are never writable"
+                    );
+                    return json!({"ok": false, "dest": dest, "error": e});
+                }
+            }
+        }
         let home = std::env::var("HOME").unwrap_or_default();
         if dest == "/" || dest == home {
             return json!({
@@ -2401,6 +2439,68 @@ public static partial class Solo{
         let report1 = engine1.verify(&engine1.emit(&plan1, true), None, Some(&plan1));
         assert_eq!(report1["ok"].as_bool(), Some(true), "report: {report1}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reorg write route (`reorg` / `expand_namespace {dest}`) obeys the
+    /// same central scope as every other write: a destination in `Library/` or
+    /// `ProjectSettings/` is refused even with `overwrite=true`, a destination
+    /// outside the repository or outside the indexed root is refused, and an
+    /// ordinary in-root destination still writes.
+    #[test]
+    fn write_tree_obeys_the_write_scope() {
+        let dir = std::env::temp_dir().join(format!(
+            "csgraph-reorg-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for d in ["Assets/NZK toolkit v5", "Library", "ProjectSettings"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        let nodes = Map::new();
+        let texts = HashMap::new();
+        let mut engine = Reorg::new(&nodes, &texts, None, false, None);
+        engine.set_write_scope(WriteScope::new(
+            &dir,
+            &["Assets/NZK toolkit v5".to_string()],
+            true,
+        ));
+        let emitted = vec![("a.cs".to_string(), "class A {}\n".to_string())];
+
+        for dest in [dir.join("Library/out"), dir.join("ProjectSettings/out")] {
+            let wr = engine.write_tree(&emitted, dest.to_str().unwrap(), true);
+            assert_eq!(wr["ok"], false, "{dest:?}: {wr}");
+            let err = wr["error"].as_str().unwrap_or("");
+            assert!(err.starts_with("write-scope refusal:"), "{dest:?}: {err}");
+            assert!(
+                err.contains("engine-managed directory"),
+                "{dest:?}: {err}"
+            );
+            assert!(!dest.exists(), "a refused reorg write must not land: {dest:?}");
+        }
+        // outside the repository is refused unconditionally
+        let wr = engine.write_tree(&emitted, "/tmp/csgraph-reorg-scope-escape", true);
+        assert_eq!(wr["ok"], false, "{wr}");
+        assert!(
+            wr["error"].as_str().unwrap_or("").contains("outside the repository"),
+            "{wr}"
+        );
+        // inside the repository but outside the indexed root
+        let wr = engine.write_tree(&emitted, dir.join("elsewhere").to_str().unwrap(), true);
+        assert_eq!(wr["ok"], false, "{wr}");
+        assert!(
+            wr["error"].as_str().unwrap_or("").contains("outside the indexed root(s)"),
+            "{wr}"
+        );
+        // an ordinary in-root destination still writes
+        let out = dir.join("Assets/NZK toolkit v5/out");
+        let wr = engine.write_tree(&emitted, out.to_str().unwrap(), true);
+        assert_eq!(wr["ok"], true, "{wr}");
+        assert!(out.join("a.cs").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

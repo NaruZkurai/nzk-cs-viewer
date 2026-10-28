@@ -756,11 +756,14 @@ html.panel-dragging, html.panel-resizing { user-select: none; }
 }
 
 /* Depth is a free-form number box rather than a fixed dropdown: keep the native
-   up/down arrows visible on the dark control and let the wheel spin the value. */
+   up/down arrows visible on the dark control and let the wheel spin the value.
+   The horizontal inset matches every other text box (`.text-input` /
+   `.mini-input`); `.select`'s own 4px is overridden here because this box is a
+   text field first and a select-shaped control second. */
 .depth-input {
   width: 78px;
   text-align: right;
-  padding-right: 2px;
+  padding: 0 9px;
 }
 .depth-input::-webkit-inner-spin-button {
   opacity: .85;
@@ -1608,7 +1611,9 @@ kbd {
   width: 100%;
   height: 26px;
   margin-bottom: 6px;
-  padding: 0 8px;
+  /* The same 9px horizontal inset as `.text-input`: before this the sidebar
+     boxes (8px) and the topbar box (9px) put their first glyph 1px apart. */
+  padding: 0 9px;
   background: var(--bg-input);
   color: var(--text);
   border: 1px solid var(--border);
@@ -1618,6 +1623,28 @@ kbd {
   outline: none;
 }
 .mini-input:focus { border-color: var(--accent-dim); }
+
+/* Declared types (v3-only sidebar section, created at runtime by
+   nzk_ui/src/dom.rs::apply_type_defs). Same visual language as the kind facets:
+   a bordered chip with the type name and its count. */
+.type-chips { margin-bottom: 6px; }
+.type-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: #0d131d;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: 10px;
+  cursor: pointer;
+}
+.type-chip:hover { color: var(--text); border-color: #2b3a4f; }
+.type-chip.active { color: #a9e2fb; border-color: #2f6f8f; background: #10344a; }
+.type-chip .tcount { color: var(--text-faint); font-size: 9.5px; }
+#typeList .l-kind { color: var(--vt-info, #42c3d0); }
 
 /* resolve chain */
 

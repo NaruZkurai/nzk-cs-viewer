@@ -65,7 +65,9 @@ const MCP_USAGE: &str = concat!(
     "Every tool takes an optional `repo` argument selecting which bound repository the\n",
     "call runs against: a 1-based index (\"2\" or 2), an absolute or cwd-relative path,\n",
     "or a unique repo basename. Omitted = the primary repo. `index`/`index_cancel`\n",
-    "apply to the selected repo only; `workspace` lists every bound repo.\n",
+    "apply to the selected repo only; `workspace` lists every bound repo. `bind_repo\n",
+    "{path, roots, index}` adds a repository at runtime and, by default, indexes it\n",
+    "synchronously (the call returns only after the build finishes).\n",
 );
 
 /// True when the argument is one of the recognised help spellings.

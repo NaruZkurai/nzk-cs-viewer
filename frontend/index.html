@@ -242,10 +242,10 @@
 
         <label class="check" style="margin-top:9px">
           <input type="checkbox" id="hideEdgeLabels">
-          <span title="Hides only the Calling / Uses / Assigns / Constructs /
-                       Inherits / Children text pills. Every edge kind keeps its
-                       line and its arrow — no relation is removed.">
-            Hide edge word boxes</span>
+          <span title="On: VT mode — every relation is a small node (dot + word) on a
+                       direct line between its declarations. Off: the relation is a
+                       word box beside the curved arrow.">
+            VT mode — direct-line relations</span>
         </label>
 
         <div class="filter-label" style="margin-top:9px">Groups</div>
@@ -302,6 +302,11 @@
             <span class="range-name">Edge curve</span>
             <input id="curveRange" type="range" min="0" max="0.2" step="0.01" value="0.1">
             <output id="curveOut" class="range-val">0.10</output>
+          </label>
+          <label class="range" for="textSizeRange">
+            <span class="range-name">Text size</span>
+            <input id="textSizeRange" type="range" min="6" max="28" step="1" value="11">
+            <output id="textSizeOut" class="range-val">11</output>
           </label>
         </div>
 
