@@ -31,11 +31,11 @@ packaging/                  AppImage builder
 The three IDE addons are **git dependencies pinned by commit** in
 `app/Cargo.toml`:
 
-| crate | repository |
-|---|---|
-| `nzkide-module` | `NaruZkurai/nzk-cs-nzkide_module` |
-| `scratch-rs-ide-addon` | `NaruZkurai/nzk-csViewer-scratch_rs_ide_addon` |
-| `def2mcpfnnumber` | `NaruZkurai/nzk-cs-def2mcpfnnumber_rs_ide_addon` |
+| crate | repository | pinned commit |
+|---|---|---|
+| `nzkide-module` | `NaruZkurai/nzk-cs-nzkide_module` | `e4f104f` |
+| `scratch-rs-ide-addon` | `NaruZkurai/nzk-csViewer-scratch_rs_ide_addon` | `d5491fe` |
+| `def2mcpfnnumber` | `NaruZkurai/nzk-cs-def2mcpfnnumber_rs_ide_addon` | `a063dfc` |
 
 `nzk_ui/` is a second workspace with its own lockfile so its Blitz/Vello
 dependency set never leaks into the host.
